@@ -8,9 +8,11 @@ def parse_args():
     parser.add_argument('--dataset', type=str, default='7scenes',
                     choices=['7scenes', 'neural-rgbd', 'tum'],
                     help='which 3D reconstruction benchmark to use')
-    parser.add_argument('--data_root', type=str, default="./images",
-                    help='absolute path to dataset root')
-    
+    parser.add_argument('--train_seqs', type=str, default="./train_seqs.txt",
+                    help='absolute path to train sequences file')
+    parser.add_argument('--val_seqs', type=str, default="./val_seqs.txt",
+                    help='absolute path to validation sequences file')
+
     # TODO: add other configurations for data processing here
 
     
@@ -37,7 +39,7 @@ def parse_args():
     parser.add_argument('--device', type=str, default='cuda', choices=['cuda', 'cpu'])
     parser.add_argument('--seed', type=int, default=42, help='global random seed')
     parser.add_argument('--gpu', type=int, default=0)
-
+    parser.add_argument('--save_dir', type=str, default='./checkpoints', help='directory to save checkpoints and logs')
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--search_epochs', type=int, default=1500)  # 1500
     parser.add_argument('--save_policy_len', type=int, default=10)  # 1500

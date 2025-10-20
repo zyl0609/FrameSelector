@@ -7,10 +7,11 @@ import numpy as np
 import os, glob, shutil
 import random
 from PIL import Image
+from tqdm import tqdm
 
 from typing import Dict, List, Union
 
-from data_utils import load_sample_frames, load_and_preprocess_sample_frames
+from data_utils import load_sample_frames, read_image_sequences
 from config import parse_args
 from controller import FrameSelector
 from frame_recon import SelectedFrameReconstructor
@@ -26,7 +27,7 @@ def set_random_seed(seed: int=42):
     torch.backends.cudnn.benchmark = False
 
 
-def load_image_sequence_names(seq_folder:str)->List[str]:
+def load_image_sequences(seq_folder:str)->List[str]:
     """ Read image seqences' names. """
     if not os.path.exists(seq_folder) or not os.path.isdir(seq_folder):
         raise FileNotFoundError(f"[Error] {seq_folder} is not found or is not a folder. ")
@@ -214,8 +215,8 @@ def main(args):
     selector = FrameSelector(args, feat_dim=args.feat_dim).to(device)
     optimizer = torch.optim.SGD(selector.parameters(), lr=args.controller_lr, momentum=0.9)
 
-    seq_names = load_image_sequence_names(args.data_root)
-    print(f"[Info] Found {len(seq_names)} image sequences from {args.data_root}.")
+    seq_names = read_image_sequences(args.train_seqs)
+    print(f"[INFO] Load {len(seq_names)} image sequences from {args.train_seqs}.")
 
     baseline = None
 
@@ -252,14 +253,14 @@ def main(args):
         #   mask, log_prob = select_topk(logits, k=args.select_k, hard=True)
         #entropy = torch.zeros_like(log_prob)  # no entropy term if using hard selection
 
-        # drop the frame which scores less than 0.5
+        # Drop the frame which scores less than 0.5
         keep_idx = torch.where(mask.squeeze() > 0.5)[0].cpu().numpy()
         if keep_idx.size == 0:                       # if none selected, select the top-1
             _, top_idx = torch.topk(mask, k=1)
             keep_idx = [top_idx.item()]
         sel_images = [frames[i] for i in keep_idx]
 
-        # 4. reconstruction and project with selected frames
+        # Reconstruction and project with selected frames
         dropped_rgb_map, _ = infer_sequence(sel_images, reconstructor)
 
         # Reward computation
@@ -269,7 +270,7 @@ def main(args):
 
         baseline, train_info = train_controller(args, selector, optimizer, reward, baseline, log_prob, entropy)
 
-        # training information
+        # Training information
         train_info["sparse"] = sparse.item()
         train_info["keep_ratio"] = (mask > 0.5).float().mean().item()
         train_info["num_select"] = len(keep_idx)

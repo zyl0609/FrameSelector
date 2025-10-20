@@ -226,3 +226,16 @@ def load_and_preprocess_sample_frames(sample_frames, *, target_size=518, mode="c
             images = images.unsqueeze(0)
 
     return images
+
+
+def read_image_sequences(sequence_path_file: str) -> List[str]:
+    """
+    Read image seqences' paths.
+    """
+    if not os.path.exists(sequence_path_file) or not os.path.isfile(sequence_path_file):
+        raise FileNotFoundError(f"[Error] {sequence_path_file} is not found or is not a file. ")
+
+    with open(sequence_path_file, 'r') as f:
+        seq_paths = [line.strip() for line in f.readlines() if line.strip()]
+
+    return seq_paths
