@@ -226,13 +226,58 @@ def cleanup_checkpoints(ckp_queue, max_ckp):
             #print(f"[CLEAN] removed ckp {worst_path}")
 
 
+@torch.no_grad()
+def align_and_evaluate(pred_pts, gt_pts, criterion):
+    """
+    Manually performs scale and shift alignment, then evaluates the point clouds.
+    This mimics the logic within Regr3D_t_ScaleShiftInv for simple point cloud tensors.
+    
+    Args:
+        pred_pts (torch.Tensor): Predicted point cloud, shape (N, 3).
+        gt_pts (torch.Tensor): Ground truth point cloud, shape (M, 3).
+        criterion: The evaluation criterion object (e.g., L21).
+    
+    Returns:
+        A tuple of (accuracy, completion).
+    """
+    if pred_pts.shape[0] == 0 or gt_pts.shape[0] == 0:
+        return torch.tensor(float('nan')), torch.tensor(float('nan'))
+
+    # 1. Shift Invariance: Center both point clouds by subtracting their median
+    pred_center = torch.median(pred_pts, dim=0, keepdim=True).values
+    gt_center = torch.median(gt_pts, dim=0, keepdim=True).values
+    
+    pred_pts_centered = pred_pts - pred_center
+    gt_pts_centered = gt_pts - gt_center
+
+    # 2. Scale Invariance: Scale predicted point cloud to match GT scale
+    # The scale is the median of the norm of the points.
+    gt_scale = torch.median((gt_pts_centered).norm(dim=-1))
+    pred_scale = torch.median((pred_pts_centered).norm(dim=-1))
+    
+    # Avoid division by zero
+    if pred_scale < 1e-8:
+        pred_scale = torch.tensor(1.0, device=pred_pts.device)
+    
+    pred_pts_aligned = pred_pts_centered * (gt_scale / pred_scale)
+    
+    # 3. Evaluate metrics using the provided criterion
+    # Accuracy: For each predicted point, find the nearest GT point
+    accuracy = criterion(pred_pts_aligned, gt_pts_centered)
+    
+    # Completion: For each GT point, find the nearest predicted point
+    completion = criterion(gt_pts_centered, pred_pts_aligned)
+    
+    return accuracy, completion
+
+
 def evaluate(args, selector, reconstructor):
     """
     Evaluate the frame selector by comparing reconstruction quality.
     Uses CUT3R's official scale-invariant criterion for alignment.
     """
     # [关键] 将导入语句放在函数内部，以避免循环导入问题
-    from eval.mv_recon.criterion import Regr3D_t_ScaleShiftInv, L21 
+    from eval.mv_recon.criterion import L21 
     from eval.mv_recon.data import SevenScenes
     import open3d as o3d
     from tqdm import tqdm
@@ -242,9 +287,8 @@ def evaluate(args, selector, reconstructor):
     selector.eval()
     reconstructor.eval()
 
-    # 实例化评估器和对齐器
-    evaluator = L21().to(device)
-    aligner = Regr3D_t_ScaleShiftInv(criterion=evaluator, norm_mode=False, gt_scale=True)
+    # [修改] 我们只需要 L21 评估器本身
+    evaluator = L21.to(device)
 
     # 准备数据集
     # 注意: resolution 应该与你的模型 (VGGT) 期望的输入尺寸匹配
@@ -320,7 +364,8 @@ def evaluate(args, selector, reconstructor):
         # Full vs GT
         if full_points.shape[0] > 0:
             full_points_t = torch.from_numpy(full_points).to(device, dtype=torch.float32)
-            acc_full, _, comp_full, _, _, _ = aligner(full_points_t, gt_points_t)
+            # [修改] 使用新的辅助函数进行对齐和评估
+            acc_full, comp_full = align_and_evaluate(full_points_t, gt_points_t, evaluator)
             acc_full, comp_full = acc_full.item(), comp_full.item()
         else:
             print("Warning: No valid points in full reconstruction.")
@@ -329,7 +374,8 @@ def evaluate(args, selector, reconstructor):
         # Selected vs GT
         if sel_points.shape[0] > 0:
             sel_points_t = torch.from_numpy(sel_points).to(device, dtype=torch.float32)
-            acc_sel, _, comp_sel, _, _, _ = aligner(sel_points_t, gt_points_t)
+            # [修改] 使用新的辅助函数进行对齐和评估
+            acc_sel, comp_sel = align_and_evaluate(sel_points_t, gt_points_t, evaluator)
             acc_sel, comp_sel = acc_sel.item(), comp_sel.item()
         else:
             print("Warning: No valid points in selected reconstruction.")
