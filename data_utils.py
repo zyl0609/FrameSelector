@@ -5,6 +5,7 @@ import cv2
 import argparse
 import os
 import json
+from natsort import natsorted
 from PIL import Image
 
 from typing import List, Dict, Tuple, Union
@@ -50,7 +51,7 @@ def load_sample_frames(
     # Process image folder
     if os.path.isdir(path):
         img_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')
-        img_names = sorted([f for f in os.listdir(str(path))
+        img_names = natsorted([f for f in os.listdir(str(path))
                             if f.lower().endswith(img_exts)])
         print(f"[INFO] Loading {len(img_names)} images from folder: {os.path.abspath(path)}")
         if not img_names:
