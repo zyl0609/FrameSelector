@@ -231,112 +231,130 @@ def evaluate(args, selector, reconstructor):
     Evaluate the frame selector by comparing reconstruction quality.
     Uses CUT3R's official scale-invariant criterion for alignment.
     """
-    # [修改] 导入 L21 和 Regr3D_t_ScaleShiftInv
+    # [关键] 将导入语句放在函数内部，以避免循环导入问题
     from eval.mv_recon.criterion import Regr3D_t_ScaleShiftInv, L21 
+    from eval.mv_recon.data import SevenScenes
+    import open3d as o3d
+    from tqdm import tqdm
 
-    print("\n===== Starting Evaluation =====")
+    print("\n===== Starting Evaluation on 7-Scenes =====")
     device = args.device
     selector.eval()
     reconstructor.eval()
 
-    # [修改] 分别实例化对齐器和评估器
-    aligner = Regr3D_t_ScaleShiftInv(norm_mode=False, gt_scale=True)
+    # 实例化评估器和对齐器
     evaluator = L21().to(device)
+    aligner = Regr3D_t_ScaleShiftInv(criterion=evaluator, norm_mode=False, gt_scale=True)
 
-    # 假设评估数据集为7-Scenes
-    from eval.mv_recon.data import SevenScenes
+    # 准备数据集
+    # 注意: resolution 应该与你的模型 (VGGT) 期望的输入尺寸匹配
+    # 如果你的 config.py 中有 vggt_imgsz, 使用它
+    img_size = getattr(args, 'vggt_imgsz', 518) 
     dataset = SevenScenes(
         split="test",
-        ROOT="./data/7scenes", # 请确保路径正确
-        resolution=(518, 378),
+        ROOT="./data/7scenes",  # 请确保路径正确
+        resolution=(img_size, img_size),
         num_seq=1,
         full_video=True,
-        kf_every=10 # 评估时可以适当降低帧率
+        kf_every=10 
     )
     
     results = {}
 
-    for i in range(len(dataset)):
+    for i in tqdm(range(len(dataset)), desc="Evaluating Scenes"):
         views = dataset[i]
+        if not views:
+            continue
         scene_id = views[0]['label'].rsplit('/', 1)[0]
         print(f"\n--- Evaluating scene: {scene_id} ---")
 
-        frames = [v['img'] for v in views]
+        # 数据加载器返回的是预处理过的 torch.Tensor
+        frames_t = [v['img'] for v in views]
+
+        # 1. 使用完整序列进行重建 (基线)
+        _, _, full_world_points, full_world_points_conf = infer_sequence(frames_t, reconstructor, pcd_required=True)
         
-        # 1. 使用完整序列进行重建 (作为对比基线)
-        _, _, full_world_points, full_world_points_conf = infer_sequence(frames, reconstructor, pcd_required=True)
-        
-        # [修改] 增加置信度过滤
         conf_mask_full = full_world_points_conf.reshape(-1) > args.conf_threshold
         full_points = full_world_points.reshape(-1, 3)[conf_mask_full]
 
-        # 2. 生成Ground-Truth点云 (Metric Scale)
+        # 2. 生成 Ground-Truth 点云
         gt_points_list = []
         for view in views:
-            pose_inv = np.linalg.inv(view['camera_pose'])
+            cam_to_world_pose = view['camera_pose'] # 4x4 matrix
             cam_pts = view['pts3d'][view['valid_mask']]
-            world_pts = (pose_inv[:3, :3] @ cam_pts.T + pose_inv[:3, 3:4]).T
+            cam_pts_homo = np.hstack((cam_pts, np.ones((cam_pts.shape[0], 1))))
+            world_pts = (cam_to_world_pose @ cam_pts_homo.T).T[:, :3]
             gt_points_list.append(world_pts)
 
+        if not gt_points_list:
+            print(f"Warning: No ground truth points for scene {scene_id}. Skipping.")
+            continue
+            
         gt_points = np.concatenate(gt_points_list, axis=0)
         
-        # 为减少计算量，可以对GT点云进行降采样
         gt_pcd = o3d.geometry.PointCloud()
         gt_pcd.points = o3d.utility.Vector3dVector(gt_points)
         gt_pcd = gt_pcd.voxel_down_sample(voxel_size=0.02)
         gt_points = np.asarray(gt_pcd.points)
 
-        # 3. 使用FrameSelector选择帧并重建
-        _, embedding, _, _ = infer_sequence(frames, reconstructor, embedding_required=True)
+        # 3. 使用选择的帧进行重建
+        _, embedding, _, _ = infer_sequence(frames_t, reconstructor, embedding_required=True)
         logits, _ = selector(embedding)
         mask, _ = select_topk(logits, ratio=args.select_ratio, hard=True)
         keep_idx = torch.where(mask.squeeze() > 0.5)[0].cpu().numpy()
 
         if keep_idx.size == 0:
-            scores = torch.sigmoid(logits.squeeze())
-            _, top_idx = torch.topk(scores, k=max(1, int(args.select_ratio * len(frames))))
+            k = max(1, int(args.select_ratio * len(frames_t)))
+            _, top_idx = torch.topk(torch.sigmoid(logits.squeeze()), k=k)
             keep_idx = top_idx.cpu().numpy()
         
-        sel_images = [frames[i] for i in keep_idx]
-        _, _, sel_world_points, sel_world_points_conf = infer_sequence(sel_images, reconstructor, pcd_required=True)
+        sel_images_t = [frames_t[i] for i in keep_idx]
+        _, _, sel_world_points, sel_world_points_conf = infer_sequence(sel_images_t, reconstructor, pcd_required=True)
 
-        # [修改] 增加置信度过滤
         conf_mask_sel = sel_world_points_conf.reshape(-1) > args.conf_threshold
         sel_points = sel_world_points.reshape(-1, 3)[conf_mask_sel]
 
-        # 4. 使用 CUT3R 的 criterion 计算评估指标 (包含自动对齐)
-        # Full vs GT
-        # [修改] 先对齐，再评估
-        full_points_t = torch.from_numpy(full_points).to(device, dtype=torch.float32)
+        # 4. 对齐并计算指标
         gt_points_t = torch.from_numpy(gt_points).to(device, dtype=torch.float32)
-        
-        # 步骤1: 使用 aligner 对齐点云
-        full_points_aligned, _, _ = aligner.align(full_points_t, gt_points_t)
-        
-        # 步骤2: 使用 evaluator 计算指标
-        acc_full, _, comp_full, _, _, _ = evaluator(full_points_aligned, gt_points_t)
-        
-        # Selected vs GT
-        sel_points_t = torch.from_numpy(sel_points).to(device, dtype=torch.float32)
-        sel_points_aligned, _, _ = aligner.align(sel_points_t, gt_points_t)
-        acc_sel, _, comp_sel, _, _, _ = evaluator(sel_points_aligned, gt_points_t)
 
-        print(f"  [Full Sequence]    Accuracy: {acc_full.item():.4f}, Completion: {comp_full.item():.4f}")
-        print(f"  [Selected Frames]  Accuracy: {acc_sel.item():.4f}, Completion: {comp_sel.item():.4f} ({len(sel_images)}/{len(frames)} frames)")
+        # Full vs GT
+        if full_points.shape[0] > 0:
+            full_points_t = torch.from_numpy(full_points).to(device, dtype=torch.float32)
+            acc_full, _, comp_full, _, _, _ = aligner(full_points_t, gt_points_t)
+            acc_full, comp_full = acc_full.item(), comp_full.item()
+        else:
+            print("Warning: No valid points in full reconstruction.")
+            acc_full, comp_full = float('nan'), float('nan')
+
+        # Selected vs GT
+        if sel_points.shape[0] > 0:
+            sel_points_t = torch.from_numpy(sel_points).to(device, dtype=torch.float32)
+            acc_sel, _, comp_sel, _, _, _ = aligner(sel_points_t, gt_points_t)
+            acc_sel, comp_sel = acc_sel.item(), comp_sel.item()
+        else:
+            print("Warning: No valid points in selected reconstruction.")
+            acc_sel, comp_sel = float('nan'), float('nan')
+
+        print(f"  [Full Sequence]    Accuracy: {acc_full:.4f}, Completion: {comp_full:.4f}")
+        print(f"  [Selected Frames]  Accuracy: {acc_sel:.4f}, Completion: {comp_sel:.4f} ({len(sel_images_t)}/{len(frames_t)} frames)")
 
         results[scene_id] = {
-            'acc_full': acc_full.item(), 'comp_full': comp_full.item(),
-            'acc_sel': acc_sel.item(), 'comp_sel': comp_sel.item(),
-            'num_selected': len(sel_images), 'num_total': len(frames)
+            'acc_full': acc_full, 'comp_full': comp_full,
+            'acc_sel': acc_sel, 'comp_sel': comp_sel,
+            'num_selected': len(sel_images_t), 'num_total': len(frames_t)
         }
 
+    # 聚合最终结果
+    all_res = [res for res in results.values() if not np.isnan(res['acc_sel'])]
+    if not all_res:
+        print("\nEvaluation failed for all scenes.")
+        return
 
-    # 打印平均结果
-    avg_acc_full = np.mean([res['acc_full'] for res in results.values()])
-    avg_comp_full = np.mean([res['comp_full'] for res in results.values()])
-    avg_acc_sel = np.mean([res['acc_sel'] for res in results.values()])
-    avg_comp_sel = np.mean([res['comp_sel'] for res in results.values()])
-    avg_ratio = np.mean([res['num_selected'] / res['num_total'] for res in results.values()])
+    avg_acc_full = np.nanmean([r['acc_full'] for r in all_res])
+    avg_comp_full = np.nanmean([r['comp_full'] for r in all_res])
+    avg_acc_sel = np.nanmean([r['acc_sel'] for r in all_res])
+    avg_comp_sel = np.nanmean([r['comp_sel'] for r in all_res])
+    avg_ratio = np.mean([r['num_selected'] / r['num_total'] for r in all_res])
 
     print("\n===== Evaluation Summary =====")
     print(f"  [Full Sequence]    Avg Accuracy: {avg_acc_full:.4f}, Avg Completion: {avg_comp_full:.4f}")
@@ -383,7 +401,6 @@ def main(args):
 
     for epoch in tqdm(range(args.search_epochs)):
         seq_path = np.random.choice(seq_names)
-        print(seq_path)
 
         indices, frames = load_sample_frames(seq_path, frame_interval=args.frame_interval, pil_mode=True)
         # TODO: limit max frames
