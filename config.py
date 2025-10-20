@@ -41,7 +41,8 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42, help='global random seed')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--save_dir', type=str, default='./checkpoints', help='directory to save checkpoints and logs')
-    parser.add_argument('--mode', type=str, default='train')
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'eval'], help='train or eval mode')
+    parser.add_argument('--resume', type=str, default=None, help='path to checkpoint for evaluation or resuming training')
     parser.add_argument('--search_epochs', type=int, default=1500)  # 1500
     parser.add_argument('--save_policy_len', type=int, default=10)  # 1500
     parser.add_argument('--val_epoch', type=int, default=10)  # 1500
