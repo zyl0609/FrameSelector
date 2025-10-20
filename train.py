@@ -85,8 +85,8 @@ def infer_sequence(
     world_points = None
     world_points_conf = None
     if pcd_required:
-        world_points = pred_dict["world_points"].cpu().numpy() # (S, H, W, 3)
-        world_points_conf = pred_dict["world_points_conf"].cpu().numpy() # (S, H, W)
+        world_points = pred_dict["world_points"].cpu().float().numpy() # (S, H, W, 3)
+        world_points_conf = pred_dict["world_points_conf"].cpu().float().numpy() # (S, H, W)
     
     # Clean up large intermediate tensors immediately
     del pred_dict
@@ -231,6 +231,7 @@ def evaluate(args, selector, reconstructor):
     Evaluate the frame selector by comparing reconstruction quality.
     Uses CUT3R's official scale-invariant criterion for alignment.
     """
+    # [修改] 导入 L21 和 Regr3D_t_ScaleShiftInv
     from eval.mv_recon.criterion import Regr3D_t_ScaleShiftInv, L21 
 
     print("\n===== Starting Evaluation =====")
@@ -238,16 +239,16 @@ def evaluate(args, selector, reconstructor):
     selector.eval()
     reconstructor.eval()
 
-    # 使用 CUT3R 的评估工具，它会自动处理尺度对齐
-    # norm_mode=False 和 gt_scale=True 是 7-Scenes 评估的标准设置
-    eval_criterion = Regr3D_t_ScaleShiftInv(L21, norm_mode=False, gt_scale=True)
+    # [修改] 分别实例化对齐器和评估器
+    aligner = Regr3D_t_ScaleShiftInv(norm_mode=False, gt_scale=True)
+    evaluator = L21().to(device)
 
     # 假设评估数据集为7-Scenes
     from eval.mv_recon.data import SevenScenes
     dataset = SevenScenes(
         split="test",
         ROOT="./data/7scenes", # 请确保路径正确
-        resolution=(518, 374),
+        resolution=(518, 378),
         num_seq=1,
         full_video=True,
         kf_every=10 # 评估时可以适当降低帧率
@@ -305,14 +306,20 @@ def evaluate(args, selector, reconstructor):
 
         # 4. 使用 CUT3R 的 criterion 计算评估指标 (包含自动对齐)
         # Full vs GT
-        # criterion 需要 torch tensor, 且在特定 device 上
-        full_points_t = torch.from_numpy(full_points).to(device)
-        gt_points_t = torch.from_numpy(gt_points).to(device)
-        acc_full, _, comp_full, _, _, _ = eval_criterion(full_points_t, gt_points_t)
+        # [修改] 先对齐，再评估
+        full_points_t = torch.from_numpy(full_points).to(device, dtype=torch.float32)
+        gt_points_t = torch.from_numpy(gt_points).to(device, dtype=torch.float32)
+        
+        # 步骤1: 使用 aligner 对齐点云
+        full_points_aligned, _, _ = aligner.align(full_points_t, gt_points_t)
+        
+        # 步骤2: 使用 evaluator 计算指标
+        acc_full, _, comp_full, _, _, _ = evaluator(full_points_aligned, gt_points_t)
         
         # Selected vs GT
-        sel_points_t = torch.from_numpy(sel_points).to(device)
-        acc_sel, _, comp_sel, _, _, _ = eval_criterion(sel_points_t, gt_points_t)
+        sel_points_t = torch.from_numpy(sel_points).to(device, dtype=torch.float32)
+        sel_points_aligned, _, _ = aligner.align(sel_points_t, gt_points_t)
+        acc_sel, _, comp_sel, _, _, _ = evaluator(sel_points_aligned, gt_points_t)
 
         print(f"  [Full Sequence]    Accuracy: {acc_full.item():.4f}, Completion: {comp_full.item():.4f}")
         print(f"  [Selected Frames]  Accuracy: {acc_sel.item():.4f}, Completion: {comp_sel.item():.4f} ({len(sel_images)}/{len(frames)} frames)")
