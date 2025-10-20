@@ -20,6 +20,7 @@ from frame_recon import SelectedFrameReconstructor
 # 导入评估所需工具
 sys.path.append('./CUT3R/eval/mv_recon/')
 from utils import accuracy, completion
+from criterion import Regr3D_t_ScaleShiftInv, L21 # <--- 导入 Regr3D_t_ScaleShiftInv
 import open3d as o3d
 
 
@@ -221,11 +222,16 @@ def cleanup_checkpoints(ckp_queue, max_ckp):
 def evaluate(args, selector, reconstructor):
     """
     Evaluate the frame selector by comparing reconstruction quality.
+    Uses CUT3R's official scale-invariant criterion for alignment.
     """
     print("\n===== Starting Evaluation =====")
     device = args.device
     selector.eval()
     reconstructor.eval()
+
+    # 使用 CUT3R 的评估工具，它会自动处理尺度对齐
+    # norm_mode=False 和 gt_scale=True 是 7-Scenes 评估的标准设置
+    eval_criterion = Regr3D_t_ScaleShiftInv(L21, norm_mode=False, gt_scale=True)
 
     # 假设评估数据集为7-Scenes
     from CUT3R.eval.mv_recon.data import SevenScenes
@@ -248,55 +254,60 @@ def evaluate(args, selector, reconstructor):
         frames = [v['img'] for v in views]
         
         # 1. 使用完整序列进行重建 (作为对比基线)
-        _, _, full_pred_dict = infer_sequence(frames, reconstructor)
-        full_pcd = o3d.geometry.PointCloud()
-        full_points = full_pred_dict["world_points"].cpu().numpy().reshape(-1, 3)
-        full_pcd.points = o3d.utility.Vector3dVector(full_points)
+        _, _, full_world_points, _ = infer_sequence(frames, reconstructor, pcd_required=True)
+        full_points = full_world_points.reshape(-1, 3)
 
-        # 2. 生成Ground-Truth点云
-        gt_points = []
+        # 2. 生成Ground-Truth点云 (Metric Scale)
+        gt_points_list = []
         for view in views:
-            # 注意：这里的pts3d是相机坐标系，需要转换到世界坐标系
-            cam_pts = view['pts3d']
-            pose = view['camera_pose'] # world-to-camera
-            world_pts = (np.linalg.inv(pose[:3,:3]) @ (cam_pts.reshape(-1,3) - pose[:3,3:4].T).T).T
-            gt_points.append(world_pts)
+            pose_inv = np.linalg.inv(view['camera_pose'])
+            cam_pts = view['pts3d'][view['valid_mask']]
+            world_pts = (pose_inv[:3, :3] @ cam_pts.T + pose_inv[:3, 3:4]).T
+            gt_points_list.append(world_pts)
 
+        gt_points = np.concatenate(gt_points_list, axis=0)
+        
+        # 为减少计算量，可以对GT点云进行降采样
         gt_pcd = o3d.geometry.PointCloud()
-        gt_pcd.points = o3d.utility.Vector3dVector(np.concatenate(gt_points, axis=0))
+        gt_pcd.points = o3d.utility.Vector3dVector(gt_points)
+        gt_pcd = gt_pcd.voxel_down_sample(voxel_size=0.02)
+        gt_points = np.asarray(gt_pcd.points)
 
         # 3. 使用FrameSelector选择帧并重建
-        _, embedding, _ = infer_sequence(frames, reconstructor, embedding_required=True)
+        _, embedding, _, _ = infer_sequence(frames, reconstructor, embedding_required=True)
         logits, _ = selector(embedding)
-        mask, _, _ = selector.sample(logits, temp=args.temperature, hard=True)
+        mask, _ = select_topk(logits, ratio=args.select_ratio, hard=True)
         keep_idx = torch.where(mask.squeeze() > 0.5)[0].cpu().numpy()
+
         if keep_idx.size == 0:
-            _, top_idx = torch.topk(mask.squeeze(), k=1)
-            keep_idx = [top_idx.item()]
+            scores = torch.sigmoid(logits.squeeze())
+            _, top_idx = torch.topk(scores, k=max(1, int(args.select_ratio * len(frames))))
+            keep_idx = top_idx.cpu().numpy()
         
         sel_images = [frames[i] for i in keep_idx]
-        _, _, sel_pred_dict = infer_sequence(sel_images, reconstructor)
-        sel_pcd = o3d.geometry.PointCloud()
-        sel_points = sel_pred_dict["world_points"].cpu().numpy().reshape(-1, 3)
-        sel_pcd.points = o3d.utility.Vector3dVector(sel_points)
+        _, _, sel_world_points, _ = infer_sequence(sel_images, reconstructor, pcd_required=True)
+        sel_points = sel_world_points.reshape(-1, 3)
 
-        # 4. 计算评估指标
+        # 4. 使用 CUT3R 的 criterion 计算评估指标 (包含自动对齐)
         # Full vs GT
-        acc_full, _, _, _ = accuracy(np.asarray(gt_pcd.points), np.asarray(full_pcd.points))
-        comp_full, _ = completion(np.asarray(gt_pcd.points), np.asarray(full_pcd.points))
+        # criterion 需要 torch tensor, 且在特定 device 上
+        full_points_t = torch.from_numpy(full_points).to(device)
+        gt_points_t = torch.from_numpy(gt_points).to(device)
+        acc_full, _, comp_full, _, _, _ = eval_criterion(full_points_t, gt_points_t)
         
         # Selected vs GT
-        acc_sel, _, _, _ = accuracy(np.asarray(gt_pcd.points), np.asarray(sel_pcd.points))
-        comp_sel, _ = completion(np.asarray(gt_pcd.points), np.asarray(sel_pcd.points))
+        sel_points_t = torch.from_numpy(sel_points).to(device)
+        acc_sel, _, comp_sel, _, _, _ = eval_criterion(sel_points_t, gt_points_t)
 
-        print(f"  [Full Sequence]    Accuracy: {acc_full:.4f}, Completion: {comp_full:.4f}")
-        print(f"  [Selected Frames]  Accuracy: {acc_sel:.4f}, Completion: {comp_sel:.4f} ({len(sel_images)}/{len(frames)} frames)")
+        print(f"  [Full Sequence]    Accuracy: {acc_full.item():.4f}, Completion: {comp_full.item():.4f}")
+        print(f"  [Selected Frames]  Accuracy: {acc_sel.item():.4f}, Completion: {comp_sel.item():.4f} ({len(sel_images)}/{len(frames)} frames)")
 
         results[scene_id] = {
-            'acc_full': acc_full, 'comp_full': comp_full,
-            'acc_sel': acc_sel, 'comp_sel': comp_sel,
+            'acc_full': acc_full.item(), 'comp_full': comp_full.item(),
+            'acc_sel': acc_sel.item(), 'comp_sel': comp_sel.item(),
             'num_selected': len(sel_images), 'num_total': len(frames)
         }
+
 
     # 打印平均结果
     avg_acc_full = np.mean([res['acc_full'] for res in results.values()])
@@ -321,6 +332,14 @@ def main(args):
     reconstructor.eval()
     selector = FrameSelector(args, feat_dim=args.feat_dim).to(device)
     optimizer = torch.optim.SGD(selector.parameters(), lr=args.controller_lr, momentum=0.9)
+
+    if args.mode == 'eval':
+        if args.resume:
+            print(f"Resuming from checkpoint: {args.resume}")
+            ckp = torch.load(args.resume, map_location=device)
+            selector.load_state_dict(ckp['controller_state'])
+        evaluate(args, selector, reconstructor)
+        return
 
     seq_names = read_image_sequences(args.train_seqs)
     print(f"[INFO] Load {len(seq_names)} image sequences from {args.train_seqs}.")
