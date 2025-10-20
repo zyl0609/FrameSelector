@@ -1,9 +1,10 @@
-import os
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
+
+import os, glob, shutil
 import random
 from PIL import Image
 
@@ -170,6 +171,33 @@ def train_controller(args, selector, optimizer, reward, baseline, log_prob, entr
     return baseline, info
 
 
+def save_checkpoint(state, epoch, reward, save_dir, is_best=False):
+    """
+    Save the training state to a checkpoint file.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    # 主文件
+    fname = os.path.join(save_dir, f"ckp_ep{epoch:04d}_r{reward:.4f}.pth")
+    torch.save(state, fname)
+    # best 软链接
+    if is_best:
+        best_link = os.path.join(save_dir, "best.pth")
+        # 先删旧链接
+        if os.path.islink(best_link) or os.path.exists(best_link):
+            os.remove(best_link)
+        os.symlink(os.path.basename(fname), best_link)
+    return fname
+
+
+def cleanup_checkpoints(ckp_queue, max_ckp):
+    """Delete old checkpoints to save disk space."""
+    while len(ckp_queue) > max_ckp:
+        worst_r, worst_ep, worst_path = ckp_queue.pop(0)
+        if os.path.exists(worst_path):
+            os.remove(worst_path)
+            print(f"[CLEAN] removed ckp {worst_path}")
+
+
 def main(args):
     # Random seed setting
     device = args.device
@@ -186,7 +214,14 @@ def main(args):
 
     baseline = None
 
+    # records
     best_reward_record, best_iter_record = [], []
+    ckp_queue = []
+    max_ckp = 3
+    best_reward_so_far = -float('inf')
+    os.makedirs(args.save_dir, exist_ok=True)
+    
+    # buffer for printing running averages
     from collections import deque
     reward_buf = deque(maxlen=100)
     sparse_buf = deque(maxlen=100)
@@ -248,6 +283,27 @@ def main(args):
             f"lr={train_info['lr']:.2e}"
         )
 
+        # save the best checkpoint
+        current_r = train_info['reward']
+        is_best = current_r > best_reward_so_far
+        if is_best:
+            best_reward_so_far = current_r
+
+        # save the current checkpoint
+        state = {
+            'epoch': epoch + 1,
+            'controller_state': selector.state_dict(),
+            'optimizer_state': optimizer.state_dict(),
+            'baseline': baseline,
+            'reward': current_r,
+            'args': args,
+        }
+        fname = save_checkpoint(state, epoch + 1, current_r, args.save_dir, is_best)
+
+        # 维护 ckp 队列
+        ckp_queue.append((current_r, epoch + 1, fname))
+        ckp_queue.sort(key=lambda x: x[0])          # 小顶堆
+        cleanup_checkpoints(ckp_queue, max_ckp)
 
         best_reward_record.append(reward)
         best_iter_record.append(epoch)
