@@ -176,11 +176,11 @@ class SelectedFrameReconstructor(nn.Module):
         
 
     @torch.no_grad()
-    def _vggt_inference(self, sample_frames: List[Image.Image]) -> Dict:
+    def _vggt_inference(self, sample_frames: List) -> Dict:
         """
         Inference using VGGT model.
 
-        :param images: A tensor of shape [S, 3, H, W] representing input images.
+        :param images: A list of PIL.Image or a list of preprocessed torch.Tensor.
         :return: A torch.Tensor dictionary containing:
             {
                 "images": (S, 3, H, W)   - Input images,
@@ -198,8 +198,15 @@ class SelectedFrameReconstructor(nn.Module):
 
         dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
-        # (S, 3, H, W)
-        images = load_and_preprocess_sample_frames(sample_frames, target_size=self.args.vggt_imgsz).to(self.device)
+        if isinstance(sample_frames[0], PIL.Image.Image):
+            # Training: PIL.Image.Image List
+            images = load_and_preprocess_sample_frames(sample_frames, target_size=self.args.vggt_imgsz).to(self.device)
+        elif isinstance(sample_frames[0], torch.Tensor):
+            # Validation/Test: preprocessed Tensor List
+            images = torch.stack(sample_frames).to(self.device)
+        else:
+            raise TypeError(f"Unsupported input type for sample_frames: {type(sample_frames[0])}")
+
 
         with torch.cuda.amp.autocast(dtype=dtype):
             predictions, aggregated_token_embedding = self.model(images)    # dictionary

@@ -247,7 +247,7 @@ def evaluate(args, selector, reconstructor):
     dataset = SevenScenes(
         split="test",
         ROOT="./data/7scenes", # 请确保路径正确
-        resolution=(512, 384),
+        resolution=(518, 374),
         num_seq=1,
         full_video=True,
         kf_every=10 # 评估时可以适当降低帧率
