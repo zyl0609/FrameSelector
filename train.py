@@ -17,10 +17,17 @@ from config import parse_args
 from controller import FrameSelector
 from frame_recon import SelectedFrameReconstructor
 
-# 导入评估所需工具
-sys.path.append('./CUT3R/eval/mv_recon/')
-from utils import accuracy, completion
-from criterion import Regr3D_t_ScaleShiftInv, L21 # <--- 导入 Regr3D_t_ScaleShiftInv
+# [添加] 预加载 dust3r 模块以解决循环导入问题
+sys.path.append("./src")
+try:
+    import dust3r.heads
+    import dust3r.utils.camera
+    import dust3r.utils.geometry
+    import dust3r.post_process
+    import dust3r.cloud_opt.commons
+except ImportError as e:
+    print(f"Warning: Pre-loading dust3r modules failed. This might cause issues. Error: {e}")
+
 import open3d as o3d
 
 
@@ -224,6 +231,8 @@ def evaluate(args, selector, reconstructor):
     Evaluate the frame selector by comparing reconstruction quality.
     Uses CUT3R's official scale-invariant criterion for alignment.
     """
+    from eval.mv_recon.criterion import Regr3D_t_ScaleShiftInv, L21 
+
     print("\n===== Starting Evaluation =====")
     device = args.device
     selector.eval()
@@ -234,7 +243,7 @@ def evaluate(args, selector, reconstructor):
     eval_criterion = Regr3D_t_ScaleShiftInv(L21, norm_mode=False, gt_scale=True)
 
     # 假设评估数据集为7-Scenes
-    from CUT3R.eval.mv_recon.data import SevenScenes
+    from eval.mv_recon.data import SevenScenes
     dataset = SevenScenes(
         split="test",
         ROOT="./data/7scenes", # 请确保路径正确
@@ -254,8 +263,11 @@ def evaluate(args, selector, reconstructor):
         frames = [v['img'] for v in views]
         
         # 1. 使用完整序列进行重建 (作为对比基线)
-        _, _, full_world_points, _ = infer_sequence(frames, reconstructor, pcd_required=True)
-        full_points = full_world_points.reshape(-1, 3)
+        _, _, full_world_points, full_world_points_conf = infer_sequence(frames, reconstructor, pcd_required=True)
+        
+        # [修改] 增加置信度过滤
+        conf_mask_full = full_world_points_conf.reshape(-1) > args.conf_threshold
+        full_points = full_world_points.reshape(-1, 3)[conf_mask_full]
 
         # 2. 生成Ground-Truth点云 (Metric Scale)
         gt_points_list = []
@@ -285,8 +297,11 @@ def evaluate(args, selector, reconstructor):
             keep_idx = top_idx.cpu().numpy()
         
         sel_images = [frames[i] for i in keep_idx]
-        _, _, sel_world_points, _ = infer_sequence(sel_images, reconstructor, pcd_required=True)
-        sel_points = sel_world_points.reshape(-1, 3)
+        _, _, sel_world_points, sel_world_points_conf = infer_sequence(sel_images, reconstructor, pcd_required=True)
+
+        # [修改] 增加置信度过滤
+        conf_mask_sel = sel_world_points_conf.reshape(-1) > args.conf_threshold
+        sel_points = sel_world_points.reshape(-1, 3)[conf_mask_sel]
 
         # 4. 使用 CUT3R 的 criterion 计算评估指标 (包含自动对齐)
         # Full vs GT
@@ -399,8 +414,6 @@ def main(args):
         reward = compute_reward(dropped_rgb_map, gt_rgb_map[keep_idx]) + args.sparse_coeff * sparse
 
         baseline, train_info = train_controller(args, selector, optimizer, reward, baseline, log_prob, entropy)
-
-        del gt_rgb_map, embedding, logits, mask, log_prob, entropy, dropped_rgb_map, reward
 
         # Training information
         train_info["sparse"] = sparse.item()

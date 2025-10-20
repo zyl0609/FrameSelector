@@ -12,6 +12,8 @@ def parse_args():
                     help='absolute path to train sequences file')
     parser.add_argument('--val_seqs', type=str, default="./val_seqs.txt",
                     help='absolute path to validation sequences file')
+    parser.add_argument("--conf_threshold", type=float, default=0.9,
+                    help="confidence threshold for data filtering")
 
     # TODO: add other configurations for data processing here
 
