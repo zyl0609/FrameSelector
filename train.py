@@ -68,9 +68,9 @@ def infer_sequence(
         
     if embedding_required:
         embedding = embedding.detach().requires_grad_()
-        return rgb_map, pred_dict, embedding
+        return rgb_map, embedding
     else:
-        return rgb_map, pred_dict
+        return rgb_map, None
 
 
 def compute_reward(drop_render, gt_render):
@@ -227,7 +227,7 @@ def main(args):
     best_reward_so_far = -float('inf')
     os.makedirs(args.save_dir, exist_ok=True)
     
-    # buffer for printing running averages
+    # Buffer for printing running averages
     from collections import deque
     reward_buf = deque(maxlen=100)
     sparse_buf = deque(maxlen=100)
@@ -240,8 +240,15 @@ def main(args):
         print(seq_path)
 
         indices, frames = load_sample_frames(seq_path, frame_interval=args.frame_interval, pil_mode=True)
+        # TODO: limit max frames
+        if len(frames) > args.max_frame_num:
+            # randomly sample a subset of frames
+            selected_indices = sorted(np.random.choice(len(frames), args.max_frame_num, replace=False))
+            frames = [frames[i] for i in selected_indices]
+            indices = [indices[i] for i in selected_indices]
 
-        gt_rgb_map, gt_pred_dict, embedding = infer_sequence(frames, reconstructor, embedding_required=True)
+
+        gt_rgb_map, embedding = infer_sequence(frames, reconstructor, embedding_required=True)
         logits, _ = selector(embedding)
 
         mask, log_prob, entropy = selector.sample(logits, temp=args.temperature, hard=False)
@@ -265,8 +272,7 @@ def main(args):
 
         # Reward computation
         sparse = 1.0 - mask.mean()
-        reward = compute_reward(dropped_rgb_map, gt_rgb_map[keep_idx]) + \
-            args.entropy_coeff * entropy + args.sparse_coeff * sparse
+        reward = compute_reward(dropped_rgb_map, gt_rgb_map[keep_idx]) + args.sparse_coeff * sparse
 
         baseline, train_info = train_controller(args, selector, optimizer, reward, baseline, log_prob, entropy)
 
@@ -281,12 +287,12 @@ def main(args):
 
         # train info print
         print(f"[INFO] Epoch {epoch + 1} | "
-            f"reward={train_info['reward']:+.4f} (avg100={sum(reward_buf)/len(reward_buf):+.4f}) | "
-            f"keep={train_info['keep_ratio']:.2%} (avg100={sum(kr_buf)/len(kr_buf):.2%}) | "
-            f"sparse={train_info['sparse']:.4f} (avg100={sum(sparse_buf)/len(sparse_buf):.4f}) | "
-            f"entropy={train_info['entropy']:.3f} | "
-            f"loss={train_info['loss']:+.4f} | "
-            f"lr={train_info['lr']:.2e}"
+            f"reward: {train_info['reward']:+.4f} (avg100={sum(reward_buf)/len(reward_buf):+.4f}) | "
+            f"keep: {train_info['keep_ratio']:.2%} (avg100={sum(kr_buf)/len(kr_buf):.2%}) | "
+            f"sparse: {train_info['sparse']:.4f} (avg100={sum(sparse_buf)/len(sparse_buf):.4f}) | "
+            f"entropy: {train_info['entropy']:.3f} | "
+            f"loss: {train_info['loss']:+.4f} | "
+            f"learning rate: {train_info['lr']:.2e}"
         )
 
         # save the best checkpoint
@@ -306,13 +312,16 @@ def main(args):
         }
         fname = save_checkpoint(state, epoch + 1, current_r, args.save_dir, is_best)
 
-        # 维护 ckp 队列
+        # maintain ckp queue
         ckp_queue.append((current_r, epoch + 1, fname))
         ckp_queue.sort(key=lambda x: x[0])          # 小顶堆
         cleanup_checkpoints(ckp_queue, max_ckp)
 
         best_reward_record.append(reward)
         best_iter_record.append(epoch)
+
+        torch.cuda.empty_cache()
+        
 
         
 if __name__ == "__main__":

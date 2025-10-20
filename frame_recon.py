@@ -213,9 +213,8 @@ class SelectedFrameReconstructor(nn.Module):
             if isinstance(predictions[key], torch.Tensor):
                 predictions[key] = predictions[key].squeeze(0)
 
-        cam_to_world_mat = closed_form_inverse_se3(predictions['extrinsic'])  # (S, 4, 4)
-        cam_to_world = cam_to_world_mat[:, :3, :]  # (S, 3, 4)
-
+        #cam_to_world_mat = closed_form_inverse_se3(predictions['extrinsic'])  # (S, 4, 4)
+        #cam_to_world = cam_to_world_mat[:, :3, :]  # (S, 3, 4)
         
         if self.use_point_map:
             world_points = predictions['world_points']  # (S, H, W, 3)

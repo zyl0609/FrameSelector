@@ -18,6 +18,7 @@ def parse_args():
     
     # frame setting
     #parser.add_argument('--num_slot', type=int, default=50, help='#slots to split the frame sequence')
+    parser.add_argument('--max_frame_num', type=int, default=1000, help='max #frames to process in each sequence')
     parser.add_argument('--select_k', type=int, default=500, help='#frames to select')
     parser.add_argument('--select_ratio', type=float, default=0.5, help='ratio of frames to select')
     parser.add_argument('--frame_interval', type=int, default=1, help='take every n-th frame')
