@@ -30,9 +30,14 @@ def load_image_sequence_names(seq_folder:str)->List[str]:
     """ Read image seqences' names. """
     if not os.path.exists(seq_folder) or not os.path.isdir(seq_folder):
         raise FileNotFoundError(f"[Error] {seq_folder} is not found or is not a folder. ")
-    seq_names = sorted([os.path.join(seq_folder, seq_name) \
-                 for seq_name in os.listdir(seq_folder)])
-    return seq_names
+    
+    seq_paths = []
+    for seq_name in os.listdir(seq_folder):
+        seq_path = os.path.join(seq_folder, seq_name)
+        if os.path.isdir(seq_path):
+            seq_paths.append(seq_path)
+    seq_paths = sorted(seq_paths)
+    return seq_paths
 
 
 def infer_sequence(
