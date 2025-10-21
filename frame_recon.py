@@ -9,7 +9,7 @@ sys.path.append("./vggt")
 
 import PIL
 from PIL import Image
-from typing import List, Dict
+from typing import List, Dict, Union
 from pathlib import Path
 
 class SelectedFrameReconstructor(nn.Module):
@@ -237,3 +237,47 @@ class SelectedFrameReconstructor(nn.Module):
             predictions['world_points'] = torch.from_numpy(world_points).to(dtype=dtype, device=images.device)
 
         return predictions, aggregated_token_embedding
+    
+
+def infer_sequence(
+    image_seq: List[Image.Image],
+    reconstructor: SelectedFrameReconstructor,
+    embedding_required=False,
+    pcd_required=False
+):
+    """
+    Given a list of PIL images, infer the reconstructed results using the reconstructor.
+    :param image_seq: List of PIL images.
+    :param reconstructor: The SelectedFrameReconstructor model.
+    :param embedding_required: Whether to return the frame embeddings.
+    :return rgb_map:  The projection of point clouds to RGB map tensor.
+    :return embedding: (Optional) The frame embeddings from the teacher model.
+    :return world_points: (Optional) The reconstructed 3D world points as a numpy array.
+    :return world_points_conf: (Optional) The confidence of the reconstructed 3D world points as a numpy array.
+    """
+    with torch.no_grad():
+        pred_dict, embedding = reconstructor(image_seq)
+
+    with torch.no_grad():
+        rgb_map, depth_map, conf_map, mask_map = reconstructor._project_world_points_to_images(
+            pred_dict["images"], 
+            pred_dict["world_points"], 
+            pred_dict["world_points_conf"], 
+            pred_dict["extrinsic"], 
+            pred_dict["intrinsic"])
+
+    world_points = None
+    world_points_conf = None
+    if pcd_required:
+        world_points = pred_dict["world_points"].cpu().float().numpy() # (S, H, W, 3)
+        world_points_conf = pred_dict["world_points_conf"].cpu().float().numpy() # (S, H, W)
+    
+    # Clean up large intermediate tensors immediately
+    del pred_dict
+        
+    if embedding_required:
+        # No need for detach() or requires_grad_() here as we are in no_grad context
+        return rgb_map, embedding, world_points, world_points_conf
+    else:
+        del embedding
+        return rgb_map, None, world_points, world_points_conf

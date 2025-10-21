@@ -49,6 +49,10 @@ def parse_args():
     parser.add_argument('--save_policy_len', type=int, default=10)  # 1500
     parser.add_argument('--val_epoch', type=int, default=10)  # 1500
 
+    # evaluation settings
+    parser.add_argument('--eval_interval', type=int, default=1000, help='evaluate every N epochs')
+    parser.add_argument('--eval_dataset_path', type=str, default='./data/7scenes', help='Path to the 7Scenes dataset for evaluation')
+
     # teacher model settings
     parser.add_argument('--teacher_name', type=str, default='vggt',
                         choices=['vggt', 'cut3r', 'dust3r'],
@@ -59,9 +63,9 @@ def parse_args():
     parser.add_argument('--vggt_use_point_map', action='store_true', help='use depth map or directly world points')
     parser.add_argument('--vggt_imgsz', type=int, default=280)
 
+    
 
     # TODO: other model settings can be added here
-
 
     args = parser.parse_args()
     return args

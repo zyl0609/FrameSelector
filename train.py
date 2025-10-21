@@ -15,20 +15,20 @@ from typing import Dict, List, Union
 from data_utils import load_sample_frames, read_image_sequences
 from config import parse_args
 from controller import FrameSelector
-from frame_recon import SelectedFrameReconstructor
+from frame_recon import SelectedFrameReconstructor, infer_sequence
 
-# [添加] 预加载 dust3r 模块以解决循环导入问题
 sys.path.append("./src")
 try:
     import dust3r.heads
     import dust3r.utils.camera
     import dust3r.utils.geometry
     import dust3r.post_process
-    import dust3r.cloud_opt.commons
+    #import dust3r.cloud_opt.commons
 except ImportError as e:
     print(f"Warning: Pre-loading dust3r modules failed. This might cause issues. Error: {e}")
 
 import open3d as o3d
+from evaluation import evaluate_on_7scenes
 
 
 def set_random_seed(seed: int=42):
@@ -53,50 +53,6 @@ def load_image_sequences(seq_folder:str)->List[str]:
             seq_paths.append(seq_path)
     seq_paths = sorted(seq_paths)
     return seq_paths
-
-
-def infer_sequence(
-    image_seq: List[Image.Image],
-    reconstructor: SelectedFrameReconstructor,
-    embedding_required=False,
-    pcd_required=False
-):
-    """
-    Given a list of PIL images, infer the reconstructed results using the reconstructor.
-    :param image_seq: List of PIL images.
-    :param reconstructor: The SelectedFrameReconstructor model.
-    :param embedding_required: Whether to return the frame embeddings.
-    :return rgb_map:  The projection of point clouds to RGB map tensor.
-    :return embedding: (Optional) The frame embeddings from the teacher model.
-    :return world_points: (Optional) The reconstructed 3D world points as a numpy array.
-    :return world_points_conf: (Optional) The confidence of the reconstructed 3D world points as a numpy array.
-    """
-    with torch.no_grad():
-        pred_dict, embedding = reconstructor(image_seq)
-
-    with torch.no_grad():
-        rgb_map, depth_map, conf_map, mask_map = reconstructor._project_world_points_to_images(
-            pred_dict["images"], 
-            pred_dict["world_points"], 
-            pred_dict["world_points_conf"], 
-            pred_dict["extrinsic"], 
-            pred_dict["intrinsic"])
-
-    world_points = None
-    world_points_conf = None
-    if pcd_required:
-        world_points = pred_dict["world_points"].cpu().float().numpy() # (S, H, W, 3)
-        world_points_conf = pred_dict["world_points_conf"].cpu().float().numpy() # (S, H, W)
-    
-    # Clean up large intermediate tensors immediately
-    del pred_dict
-        
-    if embedding_required:
-        # No need for detach() or requires_grad_() here as we are in no_grad context
-        return rgb_map, embedding, world_points, world_points_conf
-    else:
-        del embedding
-        return rgb_map, None, world_points, world_points_conf
 
 
 def compute_reward(drop_render, gt_render):
@@ -226,188 +182,6 @@ def cleanup_checkpoints(ckp_queue, max_ckp):
             #print(f"[CLEAN] removed ckp {worst_path}")
 
 
-@torch.no_grad()
-def align_and_evaluate(pred_pts, gt_pts, criterion):
-    """
-    Manually performs scale and shift alignment, then evaluates the point clouds.
-    This mimics the logic within Regr3D_t_ScaleShiftInv for simple point cloud tensors.
-    
-    Args:
-        pred_pts (torch.Tensor): Predicted point cloud, shape (N, 3).
-        gt_pts (torch.Tensor): Ground truth point cloud, shape (M, 3).
-        criterion: The evaluation criterion object (e.g., L21).
-    
-    Returns:
-        A tuple of (accuracy, completion).
-    """
-    if pred_pts.shape[0] == 0 or gt_pts.shape[0] == 0:
-        return torch.tensor(float('nan')), torch.tensor(float('nan'))
-
-    # 1. Shift Invariance: Center both point clouds by subtracting their median
-    pred_center = torch.median(pred_pts, dim=0, keepdim=True).values
-    gt_center = torch.median(gt_pts, dim=0, keepdim=True).values
-    
-    pred_pts_centered = pred_pts - pred_center
-    gt_pts_centered = gt_pts - gt_center
-
-    # 2. Scale Invariance: Scale predicted point cloud to match GT scale
-    # The scale is the median of the norm of the points.
-    gt_scale = torch.median((gt_pts_centered).norm(dim=-1))
-    pred_scale = torch.median((pred_pts_centered).norm(dim=-1))
-    
-    # Avoid division by zero
-    if pred_scale < 1e-8:
-        pred_scale = torch.tensor(1.0, device=pred_pts.device)
-    
-    pred_pts_aligned = pred_pts_centered * (gt_scale / pred_scale)
-    
-    # 3. Evaluate metrics using the provided criterion
-    # Accuracy: For each predicted point, find the nearest GT point
-    accuracy = criterion(pred_pts_aligned, gt_pts_centered)
-    
-    # Completion: For each GT point, find the nearest predicted point
-    completion = criterion(gt_pts_centered, pred_pts_aligned)
-    
-    return accuracy, completion
-
-
-def evaluate(args, selector, reconstructor):
-    """
-    Evaluate the frame selector by comparing reconstruction quality.
-    Uses CUT3R's official scale-invariant criterion for alignment.
-    """
-    # [关键] 将导入语句放在函数内部，以避免循环导入问题
-    from eval.mv_recon.criterion import L21 
-    from eval.mv_recon.data import SevenScenes
-    import open3d as o3d
-    from tqdm import tqdm
-
-    print("\n===== Starting Evaluation on 7-Scenes =====")
-    device = args.device
-    selector.eval()
-    reconstructor.eval()
-
-    # [修改] 我们只需要 L21 评估器本身
-    evaluator = L21.to(device)
-
-    # 准备数据集
-    # 注意: resolution 应该与你的模型 (VGGT) 期望的输入尺寸匹配
-    # 如果你的 config.py 中有 vggt_imgsz, 使用它
-    img_size = getattr(args, 'vggt_imgsz', 518) 
-    dataset = SevenScenes(
-        split="test",
-        ROOT="./data/7scenes",  # 请确保路径正确
-        resolution=(img_size, img_size),
-        num_seq=1,
-        full_video=True,
-        kf_every=10 
-    )
-    
-    results = {}
-
-    for i in tqdm(range(len(dataset)), desc="Evaluating Scenes"):
-        views = dataset[i]
-        if not views:
-            continue
-        scene_id = views[0]['label'].rsplit('/', 1)[0]
-        print(f"\n--- Evaluating scene: {scene_id} ---")
-
-        # 数据加载器返回的是预处理过的 torch.Tensor
-        frames_t = [v['img'] for v in views]
-
-        # 1. 使用完整序列进行重建 (基线)
-        _, _, full_world_points, full_world_points_conf = infer_sequence(frames_t, reconstructor, pcd_required=True)
-        
-        conf_mask_full = full_world_points_conf.reshape(-1) > args.conf_threshold
-        full_points = full_world_points.reshape(-1, 3)[conf_mask_full]
-
-        # 2. 生成 Ground-Truth 点云
-        gt_points_list = []
-        for view in views:
-            cam_to_world_pose = view['camera_pose'] # 4x4 matrix
-            cam_pts = view['pts3d'][view['valid_mask']]
-            cam_pts_homo = np.hstack((cam_pts, np.ones((cam_pts.shape[0], 1))))
-            world_pts = (cam_to_world_pose @ cam_pts_homo.T).T[:, :3]
-            gt_points_list.append(world_pts)
-
-        if not gt_points_list:
-            print(f"Warning: No ground truth points for scene {scene_id}. Skipping.")
-            continue
-            
-        gt_points = np.concatenate(gt_points_list, axis=0)
-        
-        gt_pcd = o3d.geometry.PointCloud()
-        gt_pcd.points = o3d.utility.Vector3dVector(gt_points)
-        gt_pcd = gt_pcd.voxel_down_sample(voxel_size=0.02)
-        gt_points = np.asarray(gt_pcd.points)
-
-        # 3. 使用选择的帧进行重建
-        _, embedding, _, _ = infer_sequence(frames_t, reconstructor, embedding_required=True)
-        logits, _ = selector(embedding)
-        mask, _ = select_topk(logits, ratio=args.select_ratio, hard=True)
-        keep_idx = torch.where(mask.squeeze() > 0.5)[0].cpu().numpy()
-
-        if keep_idx.size == 0:
-            k = max(1, int(args.select_ratio * len(frames_t)))
-            _, top_idx = torch.topk(torch.sigmoid(logits.squeeze()), k=k)
-            keep_idx = top_idx.cpu().numpy()
-        
-        sel_images_t = [frames_t[i] for i in keep_idx]
-        _, _, sel_world_points, sel_world_points_conf = infer_sequence(sel_images_t, reconstructor, pcd_required=True)
-
-        conf_mask_sel = sel_world_points_conf.reshape(-1) > args.conf_threshold
-        sel_points = sel_world_points.reshape(-1, 3)[conf_mask_sel]
-
-        # 4. 对齐并计算指标
-        gt_points_t = torch.from_numpy(gt_points).to(device, dtype=torch.float32)
-
-        # Full vs GT
-        if full_points.shape[0] > 0:
-            full_points_t = torch.from_numpy(full_points).to(device, dtype=torch.float32)
-            # [修改] 使用新的辅助函数进行对齐和评估
-            acc_full, comp_full = align_and_evaluate(full_points_t, gt_points_t, evaluator)
-            acc_full, comp_full = acc_full.item(), comp_full.item()
-        else:
-            print("Warning: No valid points in full reconstruction.")
-            acc_full, comp_full = float('nan'), float('nan')
-
-        # Selected vs GT
-        if sel_points.shape[0] > 0:
-            sel_points_t = torch.from_numpy(sel_points).to(device, dtype=torch.float32)
-            # [修改] 使用新的辅助函数进行对齐和评估
-            acc_sel, comp_sel = align_and_evaluate(sel_points_t, gt_points_t, evaluator)
-            acc_sel, comp_sel = acc_sel.item(), comp_sel.item()
-        else:
-            print("Warning: No valid points in selected reconstruction.")
-            acc_sel, comp_sel = float('nan'), float('nan')
-
-        print(f"  [Full Sequence]    Accuracy: {acc_full:.4f}, Completion: {comp_full:.4f}")
-        print(f"  [Selected Frames]  Accuracy: {acc_sel:.4f}, Completion: {comp_sel:.4f} ({len(sel_images_t)}/{len(frames_t)} frames)")
-
-        results[scene_id] = {
-            'acc_full': acc_full, 'comp_full': comp_full,
-            'acc_sel': acc_sel, 'comp_sel': comp_sel,
-            'num_selected': len(sel_images_t), 'num_total': len(frames_t)
-        }
-
-    # 聚合最终结果
-    all_res = [res for res in results.values() if not np.isnan(res['acc_sel'])]
-    if not all_res:
-        print("\nEvaluation failed for all scenes.")
-        return
-
-    avg_acc_full = np.nanmean([r['acc_full'] for r in all_res])
-    avg_comp_full = np.nanmean([r['comp_full'] for r in all_res])
-    avg_acc_sel = np.nanmean([r['acc_sel'] for r in all_res])
-    avg_comp_sel = np.nanmean([r['comp_sel'] for r in all_res])
-    avg_ratio = np.mean([r['num_selected'] / r['num_total'] for r in all_res])
-
-    print("\n===== Evaluation Summary =====")
-    print(f"  [Full Sequence]    Avg Accuracy: {avg_acc_full:.4f}, Avg Completion: {avg_comp_full:.4f}")
-    print(f"  [Selected Frames]  Avg Accuracy: {avg_acc_sel:.4f}, Avg Completion: {avg_comp_sel:.4f}")
-    print(f"  Average frame selection ratio: {avg_ratio:.2%}")
-
-
 def main(args):
     # Random seed setting
     device = args.device
@@ -418,14 +192,6 @@ def main(args):
     reconstructor.eval()
     selector = FrameSelector(args, feat_dim=args.feat_dim).to(device)
     optimizer = torch.optim.SGD(selector.parameters(), lr=args.controller_lr, momentum=0.9)
-
-    if args.mode == 'eval':
-        if args.resume:
-            print(f"Resuming from checkpoint: {args.resume}")
-            ckp = torch.load(args.resume, map_location=device)
-            selector.load_state_dict(ckp['controller_state'])
-        evaluate(args, selector, reconstructor)
-        return
 
     seq_names = read_image_sequences(args.train_seqs)
     print(f"[INFO] Load {len(seq_names)} image sequences from {args.train_seqs}.")
@@ -445,97 +211,98 @@ def main(args):
     sparse_buf = deque(maxlen=100)
     kr_buf     = deque(maxlen=100)      # keep ratio buffer
 
-    for epoch in tqdm(range(args.search_epochs)):
-        seq_path = np.random.choice(seq_names)
-
-        indices, frames = load_sample_frames(seq_path, frame_interval=args.frame_interval, pil_mode=True)
-        # TODO: limit max frames
-        if len(frames) > args.max_frame_num:
-            # randomly sample a subset of frames
-            selected_indices = sorted(np.random.choice(len(frames), args.max_frame_num, replace=False))
-            frames = [frames[i] for i in selected_indices]
-            indices = [indices[i] for i in selected_indices]
-
-
-        gt_rgb_map, embedding, pseudo_pcd, pseudo_pcd_conf = infer_sequence(frames, reconstructor, embedding_required=True)
-        logits, _ = selector(embedding)
-
-        mask, log_prob, entropy = selector.sample(logits, temp=args.temperature, hard=False)
-
-        # top-k or top-ratio selection, no entropy
-        #if args.use_ratio:
-        #    mask, log_prob = select_topk(logits, ratio=args.select_ratio, hard=True)
-        #else:
-        #   mask, log_prob = select_topk(logits, k=args.select_k, hard=True)
-        #entropy = torch.zeros_like(log_prob)  # no entropy term if using hard selection
-
-        # Drop the frame which scores less than 0.5
-        keep_idx = torch.where(mask.squeeze() > 0.5)[0].cpu().numpy()
-        if keep_idx.size == 0:                       # if none selected, select the top-1
-            _, top_idx = torch.topk(mask, k=1)
-            keep_idx = [top_idx.item()]
-        sel_images = [frames[i] for i in keep_idx]
-
-        # Reconstruction and project with selected frames
-        dropped_rgb_map, _, pred_pcd, pred_pcd_conf = infer_sequence(sel_images, reconstructor)
-
-        # Reward computation
-        sparse = 1.0 - mask.mean()
-        reward = compute_reward(dropped_rgb_map, gt_rgb_map[keep_idx]) + args.sparse_coeff * sparse
-
-        baseline, train_info = train_controller(args, selector, optimizer, reward, baseline, log_prob, entropy)
-
-        # Training information
-        train_info["sparse"] = sparse.item()
-        train_info["keep_ratio"] = (mask > 0.5).float().mean().item()
-        train_info["num_select"] = len(keep_idx)
-        # monitor buffers
-        reward_buf.append(train_info['reward'])
-        sparse_buf.append(train_info['sparse'])
-        kr_buf.append(train_info['keep_ratio'])
-
-        # train info print
-        print(f"[INFO] Epoch {epoch + 1} | "
-            f"reward: {train_info['reward']:+.4f} (avg100={sum(reward_buf)/len(reward_buf):+.4f}) | "
-            f"keep: {train_info['keep_ratio']:.2%} (avg100={sum(kr_buf)/len(kr_buf):.2%}) | "
-            f"sparse: {train_info['sparse']:.4f} (avg100={sum(sparse_buf)/len(sparse_buf):.4f}) | "
-            f"entropy: {train_info['entropy']:.3f} | "
-            f"loss: {train_info['loss']:+.4f} | "
-            f"learning rate: {train_info['lr']:.2e}"
-        )
-
-        # save the best checkpoint
-        current_r = train_info['reward']
-        is_best = current_r > best_reward_so_far
-        if is_best:
-            best_reward_so_far = current_r
-
-        # save the current checkpoint
-        state = {
-            'epoch': epoch + 1,
-            'controller_state': selector.state_dict(),
-            'optimizer_state': optimizer.state_dict(),
-            'baseline': baseline,
-            'reward': current_r,
-            'args': args,
-        }
-        fname = save_checkpoint(state, epoch + 1, current_r, args.save_dir, is_best)
-
-        # maintain ckp queue
-        ckp_queue.append((current_r, epoch + 1, fname))
-        ckp_queue.sort(key=lambda x: x[0])          # 小顶堆
-        cleanup_checkpoints(ckp_queue, max_ckp)
-
-        best_reward_record.append(reward)
-        best_iter_record.append(epoch)
-
-        del gt_rgb_map, embedding, logits, mask, log_prob, entropy, dropped_rgb_map, reward
-
-        if epoch % args.val_epoch == 0:
-            evaluate(args, selector, reconstructor)
+    for epoch in range(args.search_epochs):
+        print(f"======== Epoch {epoch + 1}/{args.search_epochs} ========")
+        random.shuffle(seq_names)
+        for seq_path in tqdm(seq_names):
+            indices, frames = load_sample_frames(seq_path, frame_interval=args.frame_interval, pil_mode=True)
+            if len(frames) > args.max_frame_num:
+                # randomly sample a subset of frames
+                selected_indices = sorted(np.random.choice(len(frames), args.max_frame_num, replace=False))
+                frames = [frames[i] for i in selected_indices]
+                indices = [indices[i] for i in selected_indices]
 
 
-        torch.cuda.empty_cache()
+            gt_rgb_map, embedding, pseudo_pcd, pseudo_pcd_conf = infer_sequence(frames, reconstructor, embedding_required=True)
+            logits, _ = selector(embedding)
+            mask, log_prob, entropy = selector.sample(logits, temp=args.temperature, hard=False)
+
+            # top-k or top-ratio selection, no entropy
+            #if args.use_ratio:
+            #    mask, log_prob = select_topk(logits, ratio=args.select_ratio, hard=True)
+            #else:
+            #   mask, log_prob = select_topk(logits, k=args.select_k, hard=True)
+            #entropy = torch.zeros_like(log_prob)  # no entropy term if using hard selection
+
+            # Drop the frame which scores less than 0.5
+            keep_idx = torch.where(mask.squeeze() > 0.5)[0].cpu().numpy()
+            if keep_idx.size == 0:                       # if none selected, select the top-1
+                _, top_idx = torch.topk(mask, k=1)
+                keep_idx = [top_idx.item()]
+            sel_images = [frames[i] for i in keep_idx]
+
+            # Reconstruction and project with selected frames
+            dropped_rgb_map, _, pred_pcd, pred_pcd_conf = infer_sequence(sel_images, reconstructor)
+
+            # Reward computation
+            sparse = 1.0 - mask.mean()
+            reward = compute_reward(dropped_rgb_map, gt_rgb_map[keep_idx]) + args.sparse_coeff * sparse
+
+            baseline, train_info = train_controller(args, selector, optimizer, reward, baseline, log_prob, entropy)
+
+            # Training information
+            train_info["sparse"] = sparse.item()
+            train_info["keep_ratio"] = (mask > 0.5).float().mean().item()
+            train_info["num_select"] = len(keep_idx)
+            # monitor buffers
+            reward_buf.append(train_info['reward'])
+            sparse_buf.append(train_info['sparse'])
+            kr_buf.append(train_info['keep_ratio'])
+
+            # train info print
+            print(f"[INFO] Epoch {epoch + 1} | "
+                f"reward: {train_info['reward']:+.4f} (avg100={sum(reward_buf)/len(reward_buf):+.4f}) | "
+                f"keep: {train_info['keep_ratio']:.2%} (avg100={sum(kr_buf)/len(kr_buf):.2%}) | "
+                f"sparse: {train_info['sparse']:.4f} (avg100={sum(sparse_buf)/len(sparse_buf):.4f}) | "
+                f"entropy: {train_info['entropy']:.3f} | "
+                f"loss: {train_info['loss']:+.4f} | "
+                f"learning rate: {train_info['lr']:.2e}"
+            )
+
+            # save the best checkpoint
+            current_r = train_info['reward']
+            is_best = current_r > best_reward_so_far
+            if is_best:
+                best_reward_so_far = current_r
+
+            # save the current checkpoint
+            state = {
+                'epoch': epoch + 1,
+                'controller_state': selector.state_dict(),
+                'optimizer_state': optimizer.state_dict(),
+                'baseline': baseline,
+                'reward': current_r,
+                'args': args,
+            }
+            fname = save_checkpoint(state, epoch + 1, current_r, args.save_dir, is_best)
+
+            # maintain ckp queue
+            ckp_queue.append((current_r, epoch + 1, fname))
+            ckp_queue.sort(key=lambda x: x[0])          # 小顶堆
+            cleanup_checkpoints(ckp_queue, max_ckp)
+            best_reward_record.append(reward)
+            best_iter_record.append(epoch)
+
+            del gt_rgb_map, embedding, logits, mask, log_prob, entropy, dropped_rgb_map, reward
+            torch.cuda.empty_cache()
+
+            # === Periodical Evaluation ===
+            if (epoch + 1) % args.eval_interval == 0:
+                eval_metrics = evaluate_on_7scenes(args, selector, reconstructor, device)
+                # You can log these metrics to a file or a logger like TensorBoard
+                print(f"[EVAL-METRICS] Epoch {epoch + 1}: {eval_metrics}")
+
+    
         
 
         
