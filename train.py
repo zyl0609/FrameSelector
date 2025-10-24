@@ -199,7 +199,7 @@ def main(args):
     # records
     best_reward_record, best_iter_record = [], []
     ckp_queue = []
-    max_ckp = 3
+    max_ckp = 10
     best_reward_so_far = -float('inf')
     os.makedirs(args.save_dir, exist_ok=True)
     
@@ -227,7 +227,8 @@ def main(args):
                 reconstructor, 
                 render_img_required=False, 
                 embedding_required=True,
-                seq_size=args.infer_seq_size
+                seq_size=args.infer_seq_size,
+                pcd_conf_thresh=args.pcd_conf_thresh
             )
             reconstructor.free_image_cache() # free images
             end = time.time()
@@ -258,7 +259,13 @@ def main(args):
                     right = min(len(frames), right + delta)
                     valid_nb = np.intersect1d(np.arange(left, right), keep_idx)
                 local_imgs = [frames[int(idx)] for idx in valid_nb]
-                local_rgb_map, _, _ = infer_sequence(local_imgs, reconstructor) #(L, 3, H, W)
+
+                local_rgb_map, _, _ = infer_sequence(
+                    local_imgs, 
+                    reconstructor,
+                    pcd_conf_thresh=args.pcd_conf_thresh
+                ) #(L, 3, H, W)
+                
                 reconstructor.free_image_cache() # free images
                 local_idx = np.where(valid_nb == i)[0].item()   # current frame's index in neighborhood
                 local_rgb = local_rgb_map[local_idx].detach().clone()    # (3, H, W)
@@ -275,7 +282,8 @@ def main(args):
             dropped_rgb_map, _, _ = infer_sequence(
                 sel_images, 
                 reconstructor, 
-                seq_size=args.infer_seq_size
+                seq_size=args.infer_seq_size,
+                pcd_conf_thresh=args.pcd_conf_thresh
             )
             reconstructor.free_image_cache() # free images
             end = time.time()

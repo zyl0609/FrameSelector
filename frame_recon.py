@@ -3,6 +3,7 @@ import sys
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 import open3d
 
 from data_utils import load_and_preprocess_sample_frames
@@ -183,7 +184,7 @@ class SelectedFrameReconstructor(nn.Module):
         world_points_conf: torch.Tensor,
         extrinsic: torch.Tensor,
         intrinsic: torch.Tensor,
-        conf_threshold: float=0.5
+        conf_threshold: float=0.75
     ):
         """
         Project 3D world points to 2D image plane using camera parameters.
@@ -212,8 +213,8 @@ class SelectedFrameReconstructor(nn.Module):
         mask_out  = torch.zeros((S, 1, H, W), device=device, dtype=dtype)
 
         # flatten
-        pts3d = world_points.reshape(-1, 3)                          # (N, 3)  N=K*H*W
-        conf  = world_points_conf.reshape(-1)                        # (N,)
+        pts3d = world_points.reshape(-1, 3)                       # (N, 3)  N=K*H*W
+        conf  = world_points_conf.reshape(-1)          # (N,)
         rgb   = images.permute(0, 2, 3, 1).reshape(-1, 3)         # (N, 3)
 
         for s in range(S):
@@ -238,7 +239,7 @@ class SelectedFrameReconstructor(nn.Module):
             pix_idx = v.long() * W + u.long()                              # (N,)
             depth_buf = torch.full((H*W,), float('inf'), device=device, dtype=torch.float32)
             depth_buf.scatter_reduce_(0, pix_idx[valid], z[valid], reduce='amin', include_self=True)
-            hit = (z == depth_buf[pix_idx]) & valid
+            hit = (z <= depth_buf[pix_idx] + 1e-3) & valid
 
             # bilinear interpolation
             u0 = u.long(); u1 = torch.min(u0+1, torch.tensor(W-1, device=device))
@@ -258,10 +259,15 @@ class SelectedFrameReconstructor(nn.Module):
 
             rgb_buf  = torch.zeros((H*W, 3), device=device, dtype=dtype)
             conf_buf = torch.zeros((H*W,),   device=device, dtype=dtype)
+            wsum_buf = torch.zeros((H*W,),   device=device, dtype=dtype)
 
             for w, pix in [(w00, pix00), (w01, pix01), (w10, pix10), (w11, pix11)]:
                 rgb_buf.index_add_(0, pix, (w.unsqueeze(-1)*rgb).to(dtype))
                 conf_buf.index_add_(0, pix, w*conf)
+                wsum_buf.index_add_(0, pix, w)
+            
+            valid_pixel = wsum_buf > 1e-3
+            rgb_buf[valid_pixel] /= wsum_buf[valid_pixel].unsqueeze(-1)
 
             over_exposed = (rgb_buf > 1.0).any(dim=1)
             rgb_buf.clamp_(0, 1)
@@ -364,7 +370,7 @@ class SelectedFrameReconstructor(nn.Module):
         
         if self.use_point_map:
             world_points = predictions['world_points']  # (S, H, W, 3)
-            conf_map = predictions['world_points_conf']  # (S, H, W)
+            # conf_map = predictions['world_points_conf']  # (S, H, W)
         else:
             # compute world points from depth map
             depth_map = predictions['depth']  # (S, H, W, 1)
@@ -374,6 +380,10 @@ class SelectedFrameReconstructor(nn.Module):
                 depth_map, predictions['extrinsic'], predictions['intrinsic']) # (S, H, W, 3)
             # use depth confidence as point confidence
             predictions['world_points'] = torch.from_numpy(world_points).float().to(device=images.device)
+            predictions['world_points_conf'] = depth_conf # logits
+
+        # convert logitis to probs
+        predictions['world_points_conf'] = F.sigmoid(predictions['world_points_conf'])
 
         return predictions, embeddings
     
@@ -385,7 +395,8 @@ def infer_sequence(
     render_img_required=True,
     embedding_required=False,
     pred_required=False,
-    seq_size:int = None
+    seq_size: int = None,
+    pcd_conf_thresh: float=0.7
 ):
     """
     Given a list of PIL images, infer the reconstructed results using the reconstructor.
@@ -405,16 +416,24 @@ def infer_sequence(
     # full sequence
     if seq_size is None or seq_size >= total:
         return _infer_one_batch(
-            image_seq, reconstructor,
-            render_img_required, embedding_required, pred_required
+            image_seq, 
+            reconstructor,
+            render_img_required, 
+            embedding_required, 
+            pred_required,
+            pcd_conf_thresh
         )
     
     # split to some sequence batches
     rgb_list, pred_list, emb_list = [], [], []
     for i in range(0, total, seq_size):
         sub_rgb, sub_pred, sub_emb = _infer_one_batch(
-            image_seq[i: i + seq_size], reconstructor,
-            render_img_required, embedding_required, pred_required
+            image_seq[i: i + seq_size], 
+            reconstructor,
+            render_img_required, 
+            embedding_required, 
+            pred_required,
+            pcd_conf_thresh
         )
         if sub_rgb is not None:
             rgb_list.append(sub_rgb.detach().cpu())
@@ -447,6 +466,7 @@ def _infer_one_batch(
     render_img_required: bool,
     embedding_required: bool,
     pred_required: bool,
+    pcd_conf_thresh:float = 0.7
 ):
     pred_dict, embeddings = reconstructor(image_seq)
     rgb_maps, *_ = reconstructor.project_world_points_to_images(
@@ -454,7 +474,8 @@ def _infer_one_batch(
         pred_dict["world_points"],
         pred_dict["world_points_conf"], 
         pred_dict["extrinsic"], 
-        pred_dict["intrinsic"]
+        pred_dict["intrinsic"],
+        pcd_conf_thresh
     )
 
     if not render_img_required:

@@ -59,7 +59,7 @@ def evaluate_pcd(
     dataset = SevenScenes(
         split='test',
         ROOT=args.eval_dataset_path,
-        resolution=(518, 378),
+        resolution=(518, 392),
         num_seq=1,
         full_video=True,
         kf_every=200

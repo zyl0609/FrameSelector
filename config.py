@@ -12,7 +12,7 @@ def parse_args():
                     help='absolute path to train sequences file')
     parser.add_argument('--val_seqs', type=str, default="./val_seqs.txt",
                     help='absolute path to validation sequences file')
-    parser.add_argument("--conf_threshold", type=float, default=0.8,
+    parser.add_argument("--pcd_conf_thresh", type=float, default=0.7,
                     help="confidence threshold for data filtering")
 
     # TODO: add other configurations for data processing here
@@ -36,7 +36,7 @@ def parse_args():
     parser.add_argument('--save_dir', type=str, default='./ckpt', help='directory to save checkpoints and logs')
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'eval'], help='train or eval mode')
     parser.add_argument('--resume', type=str, default=None, help='path to checkpoint for evaluation or resuming training')
-    parser.add_argument('--search_epochs', type=int, default=50)  # 1500
+    parser.add_argument('--search_epochs', type=int, default=5)  # 1500
     parser.add_argument('--save_policy_len', type=int, default=10)  # 1500
     parser.add_argument('--val_epoch', type=int, default=10)  # 1500
     parser.add_argument('--ckpt_path', type=str, default='./ckpt/000.pth', help="th pretrain model path.")
@@ -45,7 +45,7 @@ def parse_args():
     parser.add_argument('--controller_hid_size', type=int, default=2048)
     parser.add_argument('--controller_lr', type=float, default=1e-4)
     parser.add_argument('--temperature', type=float, default=1.0)
-    parser.add_argument('--sparse_coeff', type=float, default=0.0)
+    parser.add_argument('--sparse_coeff', type=float, default=1e-4)
     parser.add_argument('--entropy_coeff', type=float, default=1e-5)
     parser.add_argument('--baseline_decay', type=float, default=0.95)
     parser.add_argument('--controller_grad_clip', type=float, default=10.0)
@@ -62,7 +62,7 @@ def parse_args():
     
     # VGGT settings
     parser.add_argument('--vggt_ckpt', type=str, default='./vggt/model.pt')
-    parser.add_argument('--vggt_use_point_map', type=bool, default=False, help='use depth map or directly world points')
+    parser.add_argument('--vggt_use_point_map', type=bool, default=True, help='use depth map or directly world points')
     parser.add_argument('--vggt_neighbor_size', type=int, default=5, help='size to reconsturct point clouds.')
     parser.add_argument('--vggt_imgsz', type=int, default=518)
     

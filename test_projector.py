@@ -35,20 +35,25 @@ images_list = [Image.open(img_path).convert('RGB') for img_path in images_names]
 recon = SelectedFrameReconstructor(args)
 predictions, _ = recon._vggt_inference(images_list)
 recon.free_image_cache()
-rgb_r, *_ = recon.project_world_points_to_images(
-    predictions["images"][:-1:2],
-    predictions["world_points"][:-1:2],
-    predictions["world_points_conf"][:-1:2],
+predictions_, _ = recon._vggt_inference(images_list[0:3])
+recon.free_image_cache()
+rgb_r, _, conf_map, *_ = recon.project_world_points_to_images(
+    predictions_["images"],
+    predictions_["world_points"],
+    predictions_["world_points_conf"],
     predictions["extrinsic"],
-    predictions["intrinsic"]
+    predictions["intrinsic"],
+    0.6
 )
+print(predictions_["world_points"].shape)
 
-pseudo_gt_rgb, *_ = recon.project_world_points_to_images(
+pseudo_gt_rgb, _, conf_gt_map, *_ = recon.project_world_points_to_images(
     predictions["images"],
     predictions["world_points"],
     predictions["world_points_conf"],
     predictions["extrinsic"],
-    predictions["intrinsic"]
+    predictions["intrinsic"],
+    0.6
 )
 
 from reward_utils import ssim_loss
@@ -62,7 +67,8 @@ print(f"SSIM-loss = {ssim.item():.4f}")
 
 
 
-
+S, H, W = predictions["world_points_conf"].shape
+print(torch.count_nonzero(predictions["world_points_conf"] > 0.9).item() / (S*H*W))
 
 
 # -------------------------------------------------
@@ -75,19 +81,20 @@ print('rgb_map  :', rgb_r.shape)      # expect (S,3,H,W)
 
 print('-------- value range ----------')
 print('rgb min/max:', rgb_r.min().item(), '/', rgb_r.max().item())
+print('conf min/max:', predictions["world_points_conf"].min().item(), '/', conf_map.max().item())
 
 
 # TODO:帮我实现一个函数，将RGB map图保存到本地，以便我查看投影效果
-def save_rgb_maps(rgb_maps, save_dir="./output_rgb_maps"):
+def save_rgb_maps(rgb_maps, save_dir="./output_rgb_maps", name=""):
     os.makedirs(save_dir, exist_ok=True)
     S, C, H, W = rgb_maps.shape
     for i in range(S):
         rgb_map = rgb_maps[i].permute(1, 2, 0).cpu().numpy()  # 转换为 (H, W, 3)
         rgb_map = (rgb_map * 255).astype(np.uint8)  # 转换为 uint8
         img = Image.fromarray(rgb_map)
-        img.save(os.path.join(save_dir, f"rgb_map_sparse_{i:03d}.png"))
+        img.save(os.path.join(save_dir, f"rgb_map_{name}_{i:03d}.png"))
     print(f"Saved {S} RGB maps to {save_dir}")
 
-#save_rgb_maps(images)   # 结果正常
-save_rgb_maps(rgb_r)    # 投影结果不正常
+save_rgb_maps(pseudo_gt_rgb, name='gt')   # 结果正常
+save_rgb_maps(rgb_r, name='sparse')    # 投影结果不正常
 
