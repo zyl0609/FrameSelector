@@ -37,7 +37,8 @@ def get_video_info(video_path:str)->Dict:
 def load_sample_frames(
         path:str,
         frame_interval: int = 1,
-        pil_mode: bool = False
+        pil_mode: bool = False,
+        max_frames: int=None
     )->Tuple[List[int], List[Union[Image.Image, np.ndarray]]]:
     """
     Load frames from image folder or video file.
@@ -57,11 +58,20 @@ def load_sample_frames(
         if not img_names:
             raise ValueError(f'[ERROR] No images found in folder: {path}')
         
+        if max_frames and len(img_names) > max_frames:
+            start = np.random.randint(0, len(img_names) - max_frames + 1)
+            img_names = img_names[start:start + max_frames]
+            print(f"[INFO] The sequence is too long, clip to {len(img_names)}.")
+        
         for ind, img_name in enumerate(img_names):
             if ind % frame_interval != 0:
                 continue
             img_path = os.path.join(path, img_name)
-            img = Image.open(img_path).convert('RGB')
+            try:
+                img = Image.open(img_path).convert('RGB')
+            except:
+                print(f"[WARN] Fail to load image {img_path}, skip it.")
+                continue
             if not pil_mode:
                 # to BGR format
                 img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
@@ -228,6 +238,13 @@ def load_and_preprocess_sample_frames(sample_frames, *, target_size=518, mode="c
     return images
 
 
+def get_dataset_path(args):
+    data_name = args.dataset
+    if data_name == '7scenes':
+        return args.data_path_7scenes
+    else:
+        raise ValueError("[ERROR] Not implement yet.")
+
 def read_image_sequences(sequence_path_file: str) -> List[str]:
     """
     Read image seqences' paths.
@@ -239,3 +256,15 @@ def read_image_sequences(sequence_path_file: str) -> List[str]:
         seq_paths = [line.strip() for line in f.readlines() if line.strip()]
 
     return seq_paths
+
+
+def vis_rgb_maps(rgb_maps, save_dir="./ckpt", indices = [0]):
+    os.makedirs(save_dir, exist_ok=True)
+    S, C, H, W = rgb_maps.shape
+    rgb_maps = rgb_maps.detach()
+    for i in indices:
+        rgb_map =  rgb_maps[i].detach().clone()
+        rgb_map = rgb_map.permute(1, 2, 0).cpu().numpy()
+        rgb_map = (rgb_map * 255).astype(np.uint8)
+        img = Image.fromarray(rgb_map)
+        img.save(os.path.join(save_dir, f"rgb_map_{i:03d}.png"))

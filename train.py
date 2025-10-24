@@ -1,4 +1,7 @@
 import sys
+import csv
+from datetime import datetime
+import time
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
@@ -16,19 +19,8 @@ from data_utils import load_sample_frames, read_image_sequences
 from config import parse_args
 from controller import FrameSelector
 from frame_recon import SelectedFrameReconstructor, infer_sequence
-
-sys.path.append("./src")
-try:
-    import dust3r.heads
-    import dust3r.utils.camera
-    import dust3r.utils.geometry
-    import dust3r.post_process
-    #import dust3r.cloud_opt.commons
-except ImportError as e:
-    print(f"Warning: Pre-loading dust3r modules failed. This might cause issues. Error: {e}")
-
-import open3d as o3d
-from evaluation import evaluate_on_7scenes
+from reward_utils import ssim_loss
+from evaluate import evaluate_pcd
 
 
 def set_random_seed(seed: int=42):
@@ -55,8 +47,13 @@ def load_image_sequences(seq_folder:str)->List[str]:
     return seq_paths
 
 
-def compute_reward(drop_render, gt_render):
-    return -F.l1_loss(drop_render, gt_render)
+def compute_reward(drop_render, gt_render, alpha=0.5, window_size=11):
+    l1 = F.l1_loss(drop_render, gt_render).item()
+    ssim = ssim_loss(drop_render, gt_render, window_size=window_size).item()
+    reward = -(alpha * l1 + (1 - alpha) * ssim)
+    print("[TRAINING] l1 =", l1)
+    print("[TRAINING] ssim =", ssim)
+    return reward
 
 
 def compute_reward_neighbor(
@@ -89,46 +86,6 @@ def compute_reward_neighbor(
     return torch.stack(rewards).mean()
 
 
-def select_topk(logits, k=None, ratio=None, hard=True):
-    """
-    logits: (B, S)  0~1概率
-    k: int          固定选k帧
-    ratio: float    按比例选
-    hard: bool      True->返回0/1 mask，False->返回soft topk权重
-    return:
-        mask: (B, S)  0/1 或 soft权重
-        log_prob: (B,)  选中的logits之和（用于RL）
-    """
-    B, S = logits.shape
-    device = logits.device
-
-    if k is None and ratio is not None:
-        k = max(1, int(ratio * S))
-    else:
-        k = k or max(1, int(0.1 * S))
-
-    # 取top-k索引
-    scores = torch.sigmoid(logits)
-    _, top_idx = torch.topk(scores, k, dim=1)  # (B, k)
-
-    if hard:
-        # 0/1 mask
-        mask = torch.zeros_like(logits)
-        mask.scatter_(1, top_idx, 1.0)
-        # 梯度用straight-through：forward=0/1，backward=scores
-        mask = (mask - scores).detach() + scores
-    else:
-        # soft：只保留top-k权重，其余置0
-        mask = torch.zeros_like(scores)
-        mask.scatter_(1, top_idx, scores.gather(1, top_idx))
-        # 归一化到总和=k（可选）
-        mask = mask * k / (mask.sum(dim=1, keepdim=True) + 1e-6)
-
-    # 简单log_prob：选中帧的logits之和
-    log_prob = logits.gather(1, top_idx).sum(dim=1)
-    return mask, log_prob
-
-
 def train_controller(args, selector, optimizer, reward, baseline, log_prob, entropy):
     selector.train()
     if baseline is None:
@@ -145,7 +102,20 @@ def train_controller(args, selector, optimizer, reward, baseline, log_prob, entr
     loss.backward()
     if args.controller_grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(selector.parameters(), args.controller_grad_clip)
+    print("[TRAINING] head.grad", selector.head.weight.grad.norm().item())
+    print("[TRAINING] lstm.weight_ih.grad", selector.lstm.weight_ih.grad.norm().item())
+    
+    old_params = {name: param.clone().detach() for name, param in selector.named_parameters()}
+
     optimizer.step()
+    
+    delta_norms = {}
+    for name, param in selector.named_parameters():
+        if param.grad is not None:
+            delta = param - old_params[name]
+            delta_norms[name] = torch.norm(delta).item()
+    print(f"[UPDATE] head.weight Δ = {delta_norms.get('head.weight', 0):.6f}")
+    print(f"[UPDATE] lstm.weight_ih Δ = {delta_norms.get('lstm.weight_ih', 0):.6f}")
 
     info = {
         "loss": loss.item(),
@@ -163,7 +133,7 @@ def save_checkpoint(state, epoch, reward, save_dir, is_best=False):
     Save the training state to a checkpoint file.
     """
     os.makedirs(save_dir, exist_ok=True)
-    fname = os.path.join(save_dir, f"ckp_ep{epoch:04d}_r{reward:.4f}.pth")
+    fname = os.path.join(save_dir, f"ckp_ep_{epoch:04d}_reward_{reward:.4f}.pth")
     torch.save(state, fname)
     if is_best:
         best_link = os.path.join(save_dir, "best.pth")
@@ -180,18 +150,46 @@ def cleanup_checkpoints(ckp_queue, max_ckp):
         if os.path.exists(worst_path):
             os.remove(worst_path)
             #print(f"[CLEAN] removed ckp {worst_path}")
+            
+            
+def write_log(log_name, save_dir, row):
+    os.makedirs(save_dir, exist_ok=True)
+    log_path = os.path.join(save_dir, log_name)
+    first_write = not os.path.exists(log_path)
+    with open(log_path, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if first_write:
+            writer.writerow(
+                ['epoch', 'step', 'reward', 'reward_avg100',
+                 'keep_ratio', 'keep_avg100', 'sparse', 'sparse_avg100',
+                 'entropy', 'loss', 'lr']
+            )
+        writer.writerow(row)
+        
+        
 
+            
 
 def main(args):
+    # path setting
+    save_dir = os.path.join(args.save_dir, datetime.now().strftime("%Y%m%d_%H%M%S"))
+    log_name = "log_" + datetime.now().strftime("%m%d-%H%M%S") + "_train.csv"
+
+
     # Random seed setting
     device = args.device
     cudnn.benchmark = True
     set_random_seed(args.seed)
-
+    
+    
     reconstructor = SelectedFrameReconstructor(args).to(device)
     reconstructor.eval()
     selector = FrameSelector(args, feat_dim=args.feat_dim).to(device)
     optimizer = torch.optim.SGD(selector.parameters(), lr=args.controller_lr, momentum=0.9)
+    
+    #from debugger import ParamInspector
+    #inspector = ParamInspector(selector)
+    
 
     seq_names = read_image_sequences(args.train_seqs)
     print(f"[INFO] Load {len(seq_names)} image sequences from {args.train_seqs}.")
@@ -212,41 +210,90 @@ def main(args):
     kr_buf     = deque(maxlen=100)      # keep ratio buffer
 
     for epoch in range(args.search_epochs):
-        print(f"======== Epoch {epoch + 1}/{args.search_epochs} ========")
-        random.shuffle(seq_names)
-        for seq_path in tqdm(seq_names):
-            indices, frames = load_sample_frames(seq_path, frame_interval=args.frame_interval, pil_mode=True)
-            if len(frames) > args.max_frame_num:
-                # randomly sample a subset of frames
-                selected_indices = sorted(np.random.choice(len(frames), args.max_frame_num, replace=False))
-                frames = [frames[i] for i in selected_indices]
-                indices = [indices[i] for i in selected_indices]
-
-
-            gt_rgb_map, embedding, pseudo_pcd, pseudo_pcd_conf = infer_sequence(frames, reconstructor, embedding_required=True)
-            logits, _ = selector(embedding)
+        seq_inds = [i for i in range(len(seq_names))]
+        random.shuffle(seq_inds)
+        
+        for seq_ind in tqdm(seq_inds):
+            indices, frames = load_sample_frames(
+                seq_names[seq_ind], 
+                frame_interval=args.frame_interval, 
+                pil_mode=True,
+                max_frames=args.max_frame_num
+            )
+            start = time.time()
+            # only embedding needed
+            _, _, embeddings = infer_sequence(
+                frames, 
+                reconstructor, 
+                render_img_required=False, 
+                embedding_required=True,
+                seq_size=args.infer_seq_size
+            )
+            reconstructor.free_image_cache() # free images
+            end = time.time()
+            #print(f"[INFO] Running {len(indices)} images consumes {end - start} s.")
+            print(f"[INFO] Getting embeddings consumes {end - start:.2f} s.")
+            
+            print(f"[INFO] Selecting key frames...")
+            logits, _ = selector(embeddings)
             mask, log_prob, entropy = selector.sample(logits, temp=args.temperature, hard=False)
-
-            # top-k or top-ratio selection, no entropy
-            #if args.use_ratio:
-            #    mask, log_prob = select_topk(logits, ratio=args.select_ratio, hard=True)
-            #else:
-            #   mask, log_prob = select_topk(logits, k=args.select_k, hard=True)
-            #entropy = torch.zeros_like(log_prob)  # no entropy term if using hard selection
-
-            # Drop the frame which scores less than 0.5
             keep_idx = torch.where(mask.squeeze() > 0.5)[0].cpu().numpy()
             if keep_idx.size == 0:                       # if none selected, select the top-1
                 _, top_idx = torch.topk(mask, k=1)
                 keep_idx = [top_idx.item()]
             sel_images = [frames[i] for i in keep_idx]
+            
+            start = time.time()
+            neighbor_sz = args.vggt_neighbor_size
+            gt_rgb_list = []
+            for i in keep_idx:                            # keep_idx 是 List[int]
+                left  = max(0, i - neighbor_sz)
+                right = min(len(frames), i + neighbor_sz + 1)
+                nb_idx = np.arange(left, right)
+                 
+                valid_nb = np.intersect1d(nb_idx, keep_idx)
+                if len(valid_nb) < 3:                      # at least 3 frame to reconstruct
+                    delta = 3 - len(valid_nb)
+                    left  = max(0, left - delta)
+                    right = min(len(frames), right + delta)
+                    valid_nb = np.intersect1d(np.arange(left, right), keep_idx)
+                local_imgs = [frames[int(idx)] for idx in valid_nb]
+                local_rgb_map, _, _ = infer_sequence(local_imgs, reconstructor) #(L, 3, H, W)
+                reconstructor.free_image_cache() # free images
+                local_idx = np.where(valid_nb == i)[0].item()   # current frame's index in neighborhood
+                local_rgb = local_rgb_map[local_idx].detach().clone()    # (3, H, W)
+                del local_rgb_map
+                gt_rgb_list.append(local_rgb)
+
+            gt_rgb_map = torch.stack(gt_rgb_list, dim=0).to(device) # (K, 3, H, W)
+            del gt_rgb_list
+            end = time.time()
+            print(f"[INFO] Reconstruction local neighbors consumes: total {end - start:.2f} s, average {(end - start) / len(keep_idx):.2f} s")
 
             # Reconstruction and project with selected frames
-            dropped_rgb_map, _, pred_pcd, pred_pcd_conf = infer_sequence(sel_images, reconstructor)
-
+            start = time.time()
+            dropped_rgb_map, _, _ = infer_sequence(
+                sel_images, 
+                reconstructor, 
+                seq_size=args.infer_seq_size
+            )
+            reconstructor.free_image_cache() # free images
+            end = time.time()
+            print(f"[INFO] Running {len(sel_images)} images after selection consumes {end - start:.2f} s.")
+            
+            
+            #----- DEBUG VIS
+            from data_utils import vis_rgb_maps
+            seq_label = os.path.split(seq_names[seq_ind])[-1]
+            seq_name = os.path.split(os.path.split(seq_names[seq_ind])[0])[-1]
+            vis_rgb_maps(gt_rgb_map, os.path.join("./ckpt/vis/pseudo", seq_name + "-" + seq_label), indices = [0, 1, 2])
+            vis_rgb_maps(dropped_rgb_map, os.path.join("./ckpt/vis/sparse", seq_name + "-" + seq_label), indices = [0, 1, 2])
+            #----- DEBUG VIS
+            
+            
             # Reward computation
-            sparse = 1.0 - mask.mean()
-            reward = compute_reward(dropped_rgb_map, gt_rgb_map[keep_idx]) + args.sparse_coeff * sparse
+            sparse = 1.0 - torch.where(mask.squeeze() > 0.5)[0].mean()
+            reward = compute_reward(dropped_rgb_map, gt_rgb_map) + args.sparse_coeff * sparse
 
             baseline, train_info = train_controller(args, selector, optimizer, reward, baseline, log_prob, entropy)
 
@@ -260,14 +307,32 @@ def main(args):
             kr_buf.append(train_info['keep_ratio'])
 
             # train info print
-            print(f"[INFO] Epoch {epoch + 1} | "
+            print(f"[{datetime.now().strftime('%m-%d %H:%M:%S')} "
+                f"[INFO] "
+                f"Epoch {epoch + 1} | "
                 f"reward: {train_info['reward']:+.4f} (avg100={sum(reward_buf)/len(reward_buf):+.4f}) | "
                 f"keep: {train_info['keep_ratio']:.2%} (avg100={sum(kr_buf)/len(kr_buf):.2%}) | "
                 f"sparse: {train_info['sparse']:.4f} (avg100={sum(sparse_buf)/len(sparse_buf):.4f}) | "
                 f"entropy: {train_info['entropy']:.3f} | "
                 f"loss: {train_info['loss']:+.4f} | "
-                f"learning rate: {train_info['lr']:.2e}"
+                f"lr: {train_info['lr']:.2e}"
             )
+            
+            write_log(
+                log_name,
+                save_dir, [
+                epoch + 1,
+                epoch * len(seq_inds) + seq_ind,
+                train_info['reward'],
+                sum(reward_buf) / len(reward_buf),
+                train_info['keep_ratio'],
+                sum(kr_buf) / len(kr_buf),
+                train_info['sparse'],
+                sum(sparse_buf) / len(sparse_buf),
+                train_info['entropy'],
+                train_info['loss'],
+                train_info['lr']
+            ])
 
             # save the best checkpoint
             current_r = train_info['reward']
@@ -284,25 +349,30 @@ def main(args):
                 'reward': current_r,
                 'args': args,
             }
-            fname = save_checkpoint(state, epoch + 1, current_r, args.save_dir, is_best)
+            fname = save_checkpoint(state, epoch + 1, current_r, save_dir, is_best)
 
             # maintain ckp queue
             ckp_queue.append((current_r, epoch + 1, fname))
             ckp_queue.sort(key=lambda x: x[0])          # 小顶堆
             cleanup_checkpoints(ckp_queue, max_ckp)
+
             best_reward_record.append(reward)
             best_iter_record.append(epoch)
 
-            del gt_rgb_map, embedding, logits, mask, log_prob, entropy, dropped_rgb_map, reward
+            del gt_rgb_map, embeddings, dropped_rgb_map, logits, mask, log_prob, entropy, reward
             torch.cuda.empty_cache()
-
-            # === Periodical Evaluation ===
-            if (epoch + 1) % args.eval_interval == 0:
-                eval_metrics = evaluate_on_7scenes(args, selector, reconstructor, device)
-                # You can log these metrics to a file or a logger like TensorBoard
-                print(f"[EVAL-METRICS] Epoch {epoch + 1}: {eval_metrics}")
-
-    
+            
+            
+        #if (epoch + 1) % args.val_epoch == 0:
+        #    print("\n[INFO] Validate the selector...")
+        #    selector.eval()
+        #    print("[INFO] Running without selection...")
+        #    evaluate_pcd(args, reconstructor, val_epoch=epoch+1)
+        #    print("[INFO] Running with selection...")
+        #    evaluate_pcd(args, reconstructor, selector, val_epoch=epoch+1)
+        #    print("[INFO] Done...")
+        #    selector.train()
+            
         
 
         

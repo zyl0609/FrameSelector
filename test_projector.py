@@ -24,75 +24,70 @@ sys.path.append("./vggt")
 
 from PIL import Image
 import os
-images_list = [Image.open(os.path.join("./images/test_seq", image_name)) \
-                for image_name in os.listdir("./images/test_seq")]
+images_names = sorted([os.path.join("./images/test_seq", image_name) \
+                for image_name in os.listdir("./images/test_seq")])
+images_list = [Image.open(img_path).convert('RGB') for img_path in images_names]
+
+
+
+
 
 recon = SelectedFrameReconstructor(args)
+predictions, _ = recon._vggt_inference(images_list)
+recon.free_image_cache()
+rgb_r, *_ = recon.project_world_points_to_images(
+    predictions["images"][:-1:2],
+    predictions["world_points"][:-1:2],
+    predictions["world_points_conf"][:-1:2],
+    predictions["extrinsic"],
+    predictions["intrinsic"]
+)
 
-predcitions, _ = recon._vggt_inference(images_list)
+pseudo_gt_rgb, *_ = recon.project_world_points_to_images(
+    predictions["images"],
+    predictions["world_points"],
+    predictions["world_points_conf"],
+    predictions["extrinsic"],
+    predictions["intrinsic"]
+)
 
-images = predcitions["images"]
-print(images.device)
+from reward_utils import ssim_loss
+ssim = ssim_loss(rgb_r, pseudo_gt_rgb, window_size=11)
+l1   = torch.nn.functional.l1_loss(rgb_r, pseudo_gt_rgb)
+print(f"L1        = {l1.item():.4f}")
+print(f"SSIM-loss = {ssim.item():.4f}")
 
-# -------------------------------------------------
-# 3. 调用并行投影函数
-# -------------------------------------------------
-with torch.no_grad():
-    rgb_r, depth_r, conf_r, mask = recon._project_world_points_to_images(
-        images, predcitions["world_points"], predcitions["world_points_conf"], predcitions["extrinsic"], predcitions["intrinsic"])
+#from frame_recon import infer_sequence
+#rgb_r, _, emb = infer_sequence(images_list, recon, seq_size=1, embedding_required=True)
+
+
+
+
+
 
 # -------------------------------------------------
 # 4. 快速 sanity check
 # -------------------------------------------------
 print('-------- output shapes --------')
+print("len(images_list):", len(images_list))
 print('rgb_map  :', rgb_r.shape)      # expect (S,3,H,W)
-print('depth_map:', depth_r.shape)    # expect (S,1,H,W)
-print('conf_map :', conf_r.shape)     # expect (S,1,H,W)
-print('mask_map :', mask.shape)       # expect (S,1,H,W)
+
 
 print('-------- value range ----------')
 print('rgb min/max:', rgb_r.min().item(), '/', rgb_r.max().item())
-print('depth min/max:', depth_r.min().item(), '/', depth_r.max().item())
-print('conf min/max:', conf_r.min().item(), '/', conf_r.max().item())
-print('mask occupancy:', mask.mean().item(), '(>0 表示有有效投影)')
 
-# -------------------------------------------------
-# 5. 可视化第一帧（保存到本地）
-# -------------------------------------------------
-out_dir = Path('_test_render')
-out_dir.mkdir(exist_ok=True)
 
-# 原图
-for i, image in enumerate(images_list):
-    Image.fromarray((images[i].permute(1,2,0).cpu().numpy()*255).astype(np.uint8))\
-        .save(out_dir / f'00{i}_input.png')
+# TODO:帮我实现一个函数，将RGB map图保存到本地，以便我查看投影效果
+def save_rgb_maps(rgb_maps, save_dir="./output_rgb_maps"):
+    os.makedirs(save_dir, exist_ok=True)
+    S, C, H, W = rgb_maps.shape
+    for i in range(S):
+        rgb_map = rgb_maps[i].permute(1, 2, 0).cpu().numpy()  # 转换为 (H, W, 3)
+        rgb_map = (rgb_map * 255).astype(np.uint8)  # 转换为 uint8
+        img = Image.fromarray(rgb_map)
+        img.save(os.path.join(save_dir, f"rgb_map_sparse_{i:03d}.png"))
+    print(f"Saved {S} RGB maps to {save_dir}")
 
-    # 重投影
-    Image.fromarray((rgb_r[i].permute(1,2,0).cpu().numpy()*255).astype(np.uint8))\
-        .save(out_dir / f'00{i}_reproj.png')
-
-    # 深度伪彩色
-    from matplotlib import pyplot as plt
-    depth_np = depth_r[0,0].cpu().numpy()
-    depth_color = (depth_np - depth_np.min()) / (depth_np.max() - depth_np.min() + 1e-6)
-    depth_color = (plt.cm.jet(depth_color)[:,:,:3]*255).astype(np.uint8)
-    Image.fromarray(depth_color).save(out_dir / f'00{i}_depth.png')
-
-print(f'-------- vis saved to {out_dir.absolute()} --------')
-
-# -------------------------------------------------
-# 6. 梯度检查（可选）
-# -------------------------------------------------
-if True:   # 开关
-    images.requires_grad_(True)
-    predcitions["world_points"].requires_grad_(True)
-    rgb_r, depth_r, conf_r, mask = recon._project_world_points_to_images(
-        images, predcitions["world_points"], predcitions["world_points_conf"], predcitions["extrinsic"], predcitions["intrinsic"])
-
-    loss = rgb_r.mean() + depth_r.mean()
-    loss.backward()
-    assert images.grad is not None and predcitions["world_points"].grad is not None
-    print('-------- gradient ok --------')
-
-print('==== All test passed! ====')
+#save_rgb_maps(images)   # 结果正常
+save_rgb_maps(rgb_r)    # 投影结果不正常
 

@@ -9,7 +9,6 @@ import open3d as o3d
 import os.path as osp
 from collections import defaultdict
 from torch.utils.data._utils.collate import default_collate
-from accelerate import Accelerator
 
 from collections import defaultdict
 import re
@@ -49,301 +48,203 @@ from eval.mv_recon.utils import accuracy, completion
 
 
 @torch.no_grad()
-def evaluate_pcd(args, selector: FrameSelector, reconstructor: SelectedFrameReconstructor):
-    """
-    Evaluates the frame selection and reconstruction pipeline on the 7Scenes dataset.
-    This function is designed to be called during the training loop.
-    """
-    datasets_all = {
-    "7scenes": SevenScenes(
-        split="test",
-        ROOT="./data/7scenes",
-        resolution=resolution,
+def evaluate_pcd(
+    args, 
+    reconstructor: SelectedFrameReconstructor, 
+    selector: FrameSelector=None, 
+    val_epoch:int=None
+):
+    # Loading dataset
+    from eval.mv_recon.data import SevenScenes
+    dataset = SevenScenes(
+        split='test',
+        ROOT=args.eval_dataset_path,
+        resolution=(518, 378),
         num_seq=1,
         full_video=True,
-        kf_every=200,
-    ),  # 20),
-    }
+        kf_every=200
+    )
 
-    accelerator = Accelerator()
-    device = accelerator.device
+    device = args.device
 
+    # Points cloud evaluation criterion
     from eval.mv_recon.criterion import Regr3D_t_ScaleShiftInv, L21
     from dust3r.utils.geometry import geotrf
-    from copy import deepcopy
+    criterion = Regr3D_t_ScaleShiftInv(L21, norm_mode="avg_dis", gt_scale=False)
 
+    # The log file path
+    save_path = osp.join(args.eval_output_dir, "7scenes")
+    os.makedirs(save_path, exist_ok=True)
     
-    print("\n[EVAL] Starting evaluation on 7Scenes...")
-    #selector.eval() # Set selector to evaluation mode
-    
-    # 1. Load 7Scenes dataset
-    try:
-        dataset = SevenScenes(
-            split='test',
-            ROOT=args.eval_dataset_path,
-            resolution=(518, 378),
-            num_seq=1,
-            full_video=True,
-            kf_every=200
-        )
-    except FileNotFoundError:
-        print(f"[ERROR] 7Scenes dataset not found at {args.eval_dataset_path}. Skipping evaluation.")
-        return {}
-    
-    criterion = Regr3D_t_ScaleShiftInv(L21, norm_mode="avg_dis", gt_scale=True)
+    log_txt_name = "log_single_proc.txt"
+    if not val_epoch:
+        log_txt_name = f"log_val_{val_epoch}.txt"
+        if selector is not None:
+            log_txt_name = f"log_val_sel_{val_epoch}.txt"
+    log_file = osp.join(save_path, log_txt_name)
 
-    for name_data, dataset in datasets_all.items():
-        save_path = osp.join(args.output_dir, name_data)
-        os.makedirs(save_path, exist_ok=True)
-        log_file = osp.join(save_path, f"logs_{accelerator.process_index}.txt")
+    acc_all, acc_all_med = 0, 0
+    comp_all, comp_all_med = 0, 0
+    nc1_all, nc1_all_med = 0, 0
+    nc2_all, nc2_all_med = 0, 0
+    fps_all, time_all = [], []
 
-        acc_all = 0
-        acc_all_med = 0
-        comp_all = 0
-        comp_all_med = 0
-        nc1_all = 0
-        nc1_all_med = 0
-        nc2_all = 0
-        nc2_all_med = 0
+    # Run sequentially
+    for data_idx in tqdm(range(len(dataset)), desc="7Scenes-eval"):
+        batch = default_collate([dataset[data_idx]]) # list of dict
 
-        fps_all = []
-        time_all = []
+        ignore_keys = {"depthmap", "dataset", "label", "instance", "idx",
+                       "true_shape", "rng"}
+        for view in batch:
+            for k in list(view.keys()):
+                if k in ignore_keys:
+                    continue
+                if isinstance(view[k], (list, tuple)):
+                    view[k] = [v.to(device, non_blocking=True) for v in view[k]]
+                else:
+                    view[k] = view[k].to(device, non_blocking=True)
 
-        with accelerator.split_between_processes(list(range(len(dataset)))) as idxs:
-            for data_idx in tqdm(idxs):
-                batch = default_collate([dataset[data_idx]])
-                print(len(batch))
-                ignore_keys = set(
-                    [
-                        "depthmap",
-                        "dataset",
-                        "label",
-                        "instance",
-                        "idx",
-                        "true_shape",
-                        "rng",
-                    ]
-                )
-                for view in batch:
-                    for name in view.keys():  # pseudo_focal
-                        if name in ignore_keys:
-                            continue
-                        if isinstance(view[name], tuple) or isinstance(
-                            view[name], list
-                        ):
-                            view[name] = [
-                                x.to(device, non_blocking=True) for x in view[name]
-                            ]
-                        else:
-                            view[name] = view[name].to(device, non_blocking=True)
+        # Reconstruction
+        start = time.time()
+        images = [batch[i]["img"] for i in range(len(batch))]
+        if selector:
+            embeddings = reconstructor.get_embedding(images)
+            reconstructor.free_image_cache() # free images
+            logits, _ = selector(embeddings)
+            mask, _, _ = selector.sample(logits, temp=args.temperature, hard=True)
+            keep_idx = torch.where(mask.squeeze() > 0.5)[0].cpu().numpy()
+            assert keep_idx.size > 0
                 
-                print("[INFO] Running full sequence inference")
-                start = time.time()
-                images = [batch[i]["img"] for i in range(len(batch))]
-                _, _, full_preds = infer_sequence(images, reconstructor, pred_required=True)
-                fps = len(batch) / (end - start)
-                end = time.time()
-                print(f"Finished reconstruction for {name_data} {data_idx+1}/{len(dataset)}, FPS: {fps:.2f}")
-                fps_all.append(fps)
-                time_all.append(end - start)
+            images = [images[i] for i in keep_idx]
+            batch = [batch[i] for i in keep_idx]
+        
+        _, preds, _ = infer_sequence(images, reconstructor, pred_required=True)
+        reconstructor.free_image_cache() # free images
+        elapsed = time.time() - start
+        fps = len(batch) / elapsed
+        fps_all.append(fps)
+        time_all.append(elapsed)
 
-                # Evaluation
-                print(f"Evaluation for {name_data} {data_idx+1}/{len(dataset)}")
-                pp_full_preds = preprocess_vggt_predictions(full_preds)
-                ggt_pts, pred_pts, gt_factor, pr_factor, masks, monitoring = (
-                    criterion.get_all_pts3d_t(batch, pp_full_preds)
-                )
-                pred_scale, gt_scale, pred_shift_z, gt_shift_z = (
-                    monitoring["pred_scale"],
-                    monitoring["gt_scale"],
-                    monitoring["pred_shift_z"],
-                    monitoring["gt_shift_z"],
-                )
+        # Preprocess to Dust3R format
+        pp_preds = preprocess_vggt_predictions(preds)
+        gt_pts, pred_pts, gt_factor, pr_factor, masks, monitoring = \
+            criterion.get_all_pts3d_t(batch, pp_preds)
+        pred_scale, gt_scale, pred_shift_z, gt_shift_z = \
+            monitoring["pred_scale"], monitoring["gt_scale"], \
+            monitoring["pred_shift_z"], monitoring["gt_shift_z"]
 
-                in_camera1 = None
-                pts_all = []
-                pts_gt_all = []
-                images_all = []
-                masks_all = []
-                conf_all = []
+        pts_all, pts_gt_all, masks_all, images_all = [], [], [], []
+        in_camera1 = None
+        for j, view in enumerate(batch):
+            if in_camera1 is None:
+                in_camera1 = view["camera_pose"][0].cpu()
 
-                for j, view in enumerate(batch):
-                    if in_camera1 is None:
-                        in_camera1 = view["camera_pose"][0].cpu()
+            img = view["img"].permute(0, 2, 3, 1).cpu().numpy()[0]          # [H,W,3]
+            msk = view["valid_mask"].cpu().numpy()[0]                        # [H,W]
+            pts = pred_pts[j].cpu().numpy()[0]                               # [H,W,3]
+            pts_gt = gt_pts[j].detach().cpu().numpy()[0]
 
-                    image = view["img"].permute(0, 2, 3, 1).cpu().numpy()[0]
-                    mask = view["valid_mask"].cpu().numpy()[0]
+            H, W = img.shape[:2]
+            cx, cy = W // 2, H // 2
+            l, t = cx - 112, cy - 112
+            r, b = cx + 112, cy + 112
+            img = img[t:b, l:r]
+            msk = msk[t:b, l:r]
+            pts = pts[t:b, l:r]
+            pts_gt = pts_gt[t:b, l:r]
 
-                    # pts = preds[j]['pts3d' if j==0 else 'pts3d_in_other_view'].detach().cpu().numpy()[0]
-                    pts = pred_pts[j].cpu().numpy()[0]
-                    conf = preds[j]["conf"].cpu().data.numpy()[0]
-                    # mask = mask & (conf > 1.8)
+            # align
+            pts[..., -1] += gt_shift_z.cpu().numpy().item()
+            pts = geotrf(in_camera1, pts)
+            pts_gt[..., -1] += gt_shift_z.cpu().numpy().item()
+            pts_gt = geotrf(in_camera1, pts_gt)
 
-                    pts_gt = gt_pts[j].detach().cpu().numpy()[0]
+            images_all.append((img[None] + 1.0) / 2.0)
+            pts_all.append(pts[None])
+            pts_gt_all.append(pts_gt[None])
+            masks_all.append(msk[None])
 
-                    H, W = image.shape[:2]
-                    cx = W // 2
-                    cy = H // 2
-                    l, t = cx - 112, cy - 112
-                    r, b = cx + 112, cy + 112
-                    image = image[t:b, l:r]
-                    mask = mask[t:b, l:r]
-                    pts = pts[t:b, l:r]
-                    pts_gt = pts_gt[t:b, l:r]
+        images_all = np.concatenate(images_all, 0)
+        pts_all = np.concatenate(pts_all, 0)
+        pts_gt_all = np.concatenate(pts_gt_all, 0)
+        masks_all = np.concatenate(masks_all, 0)
 
-                    #### Align predicted 3D points to the ground truth
-                    pts[..., -1] += gt_shift_z.cpu().numpy().item()
-                    pts = geotrf(in_camera1, pts)
+        scene_id = batch[0]["label"][0].rsplit("/", 1)[0]
 
-                    pts_gt[..., -1] += gt_shift_z.cpu().numpy().item()
-                    pts_gt = geotrf(in_camera1, pts_gt)
+        threshold = 100 if "DTU" in args.eval_dataset_path else 0.1
 
-                    images_all.append((image[None, ...] + 1.0) / 2.0)
-                    pts_all.append(pts[None, ...])
-                    pts_gt_all.append(pts_gt[None, ...])
-                    masks_all.append(mask[None, ...])
-                    conf_all.append(conf[None, ...])
+        # Maks point cloud
+        pts_m = pts_all[masks_all > 0]
+        pts_gt_m = pts_gt_all[masks_all > 0]
+        imgs_m = images_all[masks_all > 0]
 
-            images_all = np.concatenate(images_all, axis=0)
-            pts_all = np.concatenate(pts_all, axis=0)
-            pts_gt_all = np.concatenate(pts_gt_all, axis=0)
-            masks_all = np.concatenate(masks_all, axis=0)
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts_m.reshape(-1, 3))
+        pcd.colors = o3d.utility.Vector3dVector(imgs_m.reshape(-1, 3))
 
-            scene_id = view["label"][0].rsplit("/", 1)[0]
+        pcd_gt = o3d.geometry.PointCloud()
+        pcd_gt.points = o3d.utility.Vector3dVector(pts_gt_m.reshape(-1, 3))
+        pcd_gt.colors = o3d.utility.Vector3dVector(imgs_m.reshape(-1, 3))
 
-            if "DTU" in name_data:
-                threshold = 100
-            else:
-                threshold = 0.1
+        # ICP alignment
+        reg = o3d.pipelines.registration.registration_icp(
+            pcd, pcd_gt, threshold, np.eye(4),
+            o3d.pipelines.registration.TransformationEstimationPointToPoint())
+        pcd = pcd.transform(reg.transformation)
+        pcd.estimate_normals()
+        pcd_gt.estimate_normals()
 
-            pts_all_masked = pts_all[masks_all > 0]
-            pts_gt_all_masked = pts_gt_all[masks_all > 0]
-            images_all_masked = images_all[masks_all > 0]
+        # metrics
+        acc, acc_med, nc1, nc1_med = accuracy(
+            pcd_gt.points, pcd.points,
+            np.asarray(pcd_gt.normals), np.asarray(pcd.normals))
+        comp, comp_med, nc2, nc2_med = completion(
+            pcd_gt.points, pcd.points,
+            np.asarray(pcd_gt.normals), np.asarray(pcd.normals))
 
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(
-                pts_all_masked.reshape(-1, 3)
-            )
-            pcd.colors = o3d.utility.Vector3dVector(
-                images_all_masked.reshape(-1, 3)
-            )
-            #o3d.io.write_point_cloud(
-            #    os.path.join(
-            #        save_path, f"{scene_id.replace('/', '_')}-mask.ply"
-            #    ),
-            #    pcd,
-            #)
+        log_line = (f"Idx: {scene_id}, Acc: {acc:.4f}, Comp: {comp:.4f}, "
+                    f"NC1: {nc1:.4f}, NC2: {nc2:.4f} - "
+                    f"Acc_med: {acc_med:.4f}, Compc_med: {comp_med:.4f}, "
+                    f"NC1c_med: {nc1_med:.4f}, NC2c_med: {nc2_med:.4f}")
+        print(log_line)
+        with open(log_file, "a") as f:
+            f.write(log_line + "\n")
 
-            pcd_gt = o3d.geometry.PointCloud()
-            pcd_gt.points = o3d.utility.Vector3dVector(
-                pts_gt_all_masked.reshape(-1, 3)
-            )
-            pcd_gt.colors = o3d.utility.Vector3dVector(
-                images_all_masked.reshape(-1, 3)
-            )
-            #o3d.io.write_point_cloud(
-            #    os.path.join(save_path, f"{scene_id.replace('/', '_')}-gt.ply"),
-            #    pcd_gt,
-            #)
+        acc_all += acc; comp_all += comp; nc1_all += nc1; nc2_all += nc2
+        acc_all_med += acc_med; comp_all_med += comp_med
+        nc1_all_med += nc1_med; nc2_all_med += nc2_med
 
-            trans_init = np.eye(4)
+        torch.cuda.empty_cache()
 
-            reg_p2p = o3d.pipelines.registration.registration_icp(
-                pcd,
-                pcd_gt,
-                threshold,
-                trans_init,
-                o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            )
-
-            transformation = reg_p2p.transformation
-
-            pcd = pcd.transform(transformation)
-            pcd.estimate_normals()
-            pcd_gt.estimate_normals()
-
-            gt_normal = np.asarray(pcd_gt.normals)
-            pred_normal = np.asarray(pcd.normals)
-
-            acc, acc_med, nc1, nc1_med = accuracy(
-                pcd_gt.points, pcd.points, gt_normal, pred_normal
-            )
-            comp, comp_med, nc2, nc2_med = completion(
-                pcd_gt.points, pcd.points, gt_normal, pred_normal
-            )
-            print(
-                f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}"
-            )
-            print(
-                f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}",
-                file=open(log_file, "a"),
-            )
-
-            acc_all += acc
-            comp_all += comp
-            nc1_all += nc1
-            nc2_all += nc2
-
-            acc_all_med += acc_med
-            comp_all_med += comp_med
-            nc1_all_med += nc1_med
-            nc2_all_med += nc2_med
-
-            # release cuda memory
-            torch.cuda.empty_cache()
-
-    accelerator.wait_for_everyone()
-    # Get depth from pcd and run TSDFusion
-    if accelerator.is_main_process:
-        to_write = ""
-        # Copy the error log from each process to the main error log
-        for i in range(8):
-            if not os.path.exists(osp.join(save_path, f"logs_{i}.txt")):
-                break
-            with open(osp.join(save_path, f"logs_{i}.txt"), "r") as f_sub:
-                to_write += f_sub.read()
-
-        with open(osp.join(save_path, f"logs_all.txt"), "w") as f:
-            log_data = to_write
-            metrics = defaultdict(list)
-            for line in log_data.strip().split("\n"):
-                match = regex.match(line)
-                if match:
-                    data = match.groupdict()
-                    # Exclude 'scene_id' from metrics as it's an identifier
-                    for key, value in data.items():
-                        if key != "scene_id":
-                            metrics[key].append(float(value))
-                    metrics["nc"].append(
-                        (float(data["nc1"]) + float(data["nc2"])) / 2
-                    )
-                    metrics["nc_med"].append(
-                        (float(data["nc1_med"]) + float(data["nc2_med"])) / 2
-                    )
-            mean_metrics = {
-                metric: sum(values) / len(values)
-                for metric, values in metrics.items()
-            }
-
-            c_name = "mean"
-            print_str = f"{c_name.ljust(20)}: "
-            for m_name in mean_metrics:
-                print_num = np.mean(mean_metrics[m_name])
-                print_str = print_str + f"{m_name}: {print_num:.3f} | "
-            print_str = print_str + "\n"
-            f.write(to_write + print_str)
+    # compute average metrics
+    N = len(dataset)
+    mean_line = (f"mean: Acc: {acc_all/N:.3f} | Comp: {comp_all/N:.3f} | "
+                 f"NC1: {nc1_all/N:.3f} | NC2: {nc2_all/N:.3f} | "
+                 f"Acc_med: {acc_all_med/N:.3f} | Comp_med: {comp_all_med/N:.3f} | "
+                 f"NC1_med: {nc1_all_med/N:.3f} | NC2_med: {nc2_all_med/N:.3f}\n")
+    print(mean_line)
+    with open(log_file, "a") as f:
+        f.write(mean_line)
     
             
 
 
 def main(args):
     device=args.device
+
+    # init by VGGT's checkpoint
     reconstructor = SelectedFrameReconstructor(args).to(device)
     reconstructor.eval()
-    selector = FrameSelector(args, feat_dim=args.feat_dim).to(device)
+
+    selector = FrameSelector(args, 2048)
+    if os.path.isfile(args.ckpt_path):
+        print(f"[INFO] Load selector weight from {args.ckpt_path}")
+        state = torch.load(args.ckpt_path, map_location='cpu')
+        selector.load_state_dict(state["controller_state"], strict=True)
+    selector = selector.to(device)
     selector.eval()
     
-    evaluate_pcd(args, selector, reconstructor)
+    evaluate_pcd(args, reconstructor, selector)
 
 
 
