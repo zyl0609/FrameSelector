@@ -16,6 +16,7 @@ from tqdm import tqdm
 from typing import Dict, List, Union
 
 from data_utils import load_sample_frames, read_image_sequences
+from vis_utils import vis_rgb_maps, render_pcd_open3d_bev
 from config import parse_args
 from controller import FrameSelector
 from frame_recon import SelectedFrameReconstructor, infer_sequence
@@ -228,20 +229,33 @@ def main(args):
             )
             start = time.time()
             # only embedding needed
-            _, _, embeddings = infer_sequence(
+            pr = True if epoch == 0 else False
+            _, full_preds, embeddings = infer_sequence(
                 frames, 
                 reconstructor, 
                 render_img_required=False, 
                 embedding_required=True,
+                pred_required=pr
                 seq_size=args.infer_seq_size,
                 pcd_conf_thresh=args.pcd_conf_thresh
             )
             reconstructor.free_image_cache() # free images
             end = time.time()
+
+            # to visualize long sequence points cloud 
+            if pr:
+                brid_view = render_pcd_open3d_bev(
+                    full_preds["images"],
+                    full_preds["world_points"],
+                    full_preds["world_points_conf"],
+                    conf_threshold=args.pcd_conf_thresh
+                )
+                vis_rgb_maps(brid_view, os.path.join("./ckpt/vis/long-bird", seq_name + "-" + seq_label), indices = [0])
+                del full_preds
+
             #print(f"[INFO] Running {len(indices)} images consumes {end - start} s.")
             print(f"[INFO] Getting embeddings consumes {end - start:.2f} s.")
             
-            print(f"[INFO] Selecting key frames...")
             logits, _ = selector(embeddings)
             mask, log_prob, entropy = selector.sample(logits, temp=args.temperature, hard=False)
 
@@ -281,8 +295,8 @@ def main(args):
                     reconstructor,
                     pcd_conf_thresh=args.pcd_conf_thresh
                 ) #(L, 3, H, W)
-                
                 reconstructor.free_image_cache() # free images
+
                 local_idx = np.where(valid_nb == i)[0].item()   # current frame's index in neighborhood
                 local_rgb = local_rgb_map[local_idx].detach().clone()    # (3, H, W)
                 del local_rgb_map
@@ -295,9 +309,12 @@ def main(args):
 
             # Reconstruction and project with selected frames
             start = time.time()
-            dropped_rgb_map, _, _ = infer_sequence(
+            dropped_rgb_map, dropped_prds, _ = infer_sequence(
                 sel_images, 
-                reconstructor, 
+                reconstructor,
+                render_img_required=True, 
+                embedding_required=False,
+                pred_required=True,
                 seq_size=args.infer_seq_size,
                 pcd_conf_thresh=args.pcd_conf_thresh
             )
@@ -307,10 +324,19 @@ def main(args):
             
             
             #----- DEBUG VIS
-            from vis_utils import vis_rgb_maps
+            brid_view = render_pcd_open3d_bev(
+                    dropped_prds["images"],
+                    dropped_prds["world_points"],
+                    dropped_prds["world_points_conf"],
+                    conf_threshold=args.pcd_conf_thresh
+                )
+            vis_rgb_maps(brid_view, os.path.join("./ckpt/vis/drop-bird", seq_name + "-" + seq_label), indices = [0])
+            del dropped_prds
+
             seq_label = os.path.split(seq_names[seq_ind])[-1]
             seq_name = os.path.split(os.path.split(seq_names[seq_ind])[0])[-1]
-            vis_rgb_maps(gt_rgb_map, os.path.join("./ckpt/vis/pseudo", seq_name + "-" + seq_label), indices = [0, 1, 2])
+            if epoch == 0:
+                vis_rgb_maps(gt_rgb_map, os.path.join("./ckpt/vis/pseudo", seq_name + "-" + seq_label), indices = [0, 1, 2])
             vis_rgb_maps(dropped_rgb_map, os.path.join("./ckpt/vis/sparse", seq_name + "-" + seq_label), indices = [0, 1, 2])
             #----- DEBUG VIS
             
