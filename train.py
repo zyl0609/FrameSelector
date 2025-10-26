@@ -159,7 +159,7 @@ def cleanup_checkpoints(ckp_queue, max_ckp):
             #print(f"[CLEAN] removed ckp {worst_path}")
             
             
-def write_log(log_name, save_dir, row):
+def write_log(log_name, save_dir, row, keep_idx=None):
     os.makedirs(save_dir, exist_ok=True)
     log_path = os.path.join(save_dir, log_name)
     first_write = not os.path.exists(log_path)
@@ -169,9 +169,11 @@ def write_log(log_name, save_dir, row):
             writer.writerow(
                 ['epoch', 'step', 'reward', 'reward_avg100',
                  'keep_ratio', 'keep_avg100', 'sparse', 'sparse_avg100',
-                 'entropy', 'loss', 'lr']
+                 'entropy', 'loss', 'lr', 'keep_idx']
             )
-        writer.writerow(row)
+        keep_idx_str = ','.join(map(str, keep_idx)) if keep_idx is not None else ''
+
+        writer.writerow(row + [keep_idx_str])
         
         
 
@@ -379,7 +381,8 @@ def main(args):
                 sum(sparse_buf) / len(sparse_buf),
                 train_info['entropy'],
                 train_info['loss'],
-                train_info['lr']
+                train_info['lr'],
+                keep_idx
             ])
 
             # save the best checkpoint
