@@ -20,7 +20,6 @@ from config import parse_args
 from controller import FrameSelector
 from frame_recon import SelectedFrameReconstructor, infer_sequence
 from reward_utils import ssim_loss
-from evaluate import evaluate_pcd
 
 
 def set_random_seed(seed: int=42):
@@ -48,6 +47,13 @@ def load_image_sequences(seq_folder:str)->List[str]:
 
 
 def compute_reward(drop_render, gt_render, alpha=0.5, window_size=11):
+    # TODO: 有待调整：纯2D渲染做reward有问题 -> 序列较长时，使用VGGT重建后的会产生很多异常点，
+    # 必须要做点云阈值才能过滤出较好的点，否则有大片伪影；阈值较大可以，但是会导致背景大片缺失
+    # 考虑用Open3D做一次渲染
+    # 引入depth和world points相关的损失
+    # depth: 深度一致性，直接做l1 loss
+    # world points: 比较CD、Acc Comp指标，作为损失
+
     l1 = F.l1_loss(drop_render, gt_render).item()
     ssim = ssim_loss(drop_render, gt_render, window_size=window_size).item()
     reward = -(alpha * l1 + (1 - alpha) * ssim)
@@ -238,10 +244,20 @@ def main(args):
             print(f"[INFO] Selecting key frames...")
             logits, _ = selector(embeddings)
             mask, log_prob, entropy = selector.sample(logits, temp=args.temperature, hard=False)
-            keep_idx = torch.where(mask.squeeze() > 0.5)[0].cpu().numpy()
-            if keep_idx.size == 0:                       # if none selected, select the top-1
-                _, top_idx = torch.topk(mask, k=1)
-                keep_idx = [top_idx.item()]
+
+            # force to keep
+            if args.hard_ratio > 0.0:
+                k = max(1, round(args.hard_ratio * mask.size(1)))
+                _, top_idx = torch.topk(mask.squeeze(), k=k, dim=0)
+                keep_idx = sorted(top_idx.cpu().numpy().tolist())
+
+            # auto select key frames
+            else:
+                keep_idx = sorted(torch.where(mask.squeeze() > 0.5)[0].cpu().numpy().tolist())
+                if keep_idx.size == 0:                       # if none selected, select the top-1
+                    _, top_idx = torch.topk(mask, k=1)
+                    keep_idx = [top_idx.item()]
+
             sel_images = [frames[i] for i in keep_idx]
             
             start = time.time()
@@ -291,7 +307,7 @@ def main(args):
             
             
             #----- DEBUG VIS
-            from data_utils import vis_rgb_maps
+            from vis_utils import vis_rgb_maps
             seq_label = os.path.split(seq_names[seq_ind])[-1]
             seq_name = os.path.split(os.path.split(seq_names[seq_ind])[0])[-1]
             vis_rgb_maps(gt_rgb_map, os.path.join("./ckpt/vis/pseudo", seq_name + "-" + seq_label), indices = [0, 1, 2])
@@ -300,14 +316,14 @@ def main(args):
             
             
             # Reward computation
-            sparse = 1.0 - torch.where(mask.squeeze() > 0.5)[0].mean()
+            sparse = 1.0 - mask.mean()
             reward = compute_reward(dropped_rgb_map, gt_rgb_map) + args.sparse_coeff * sparse
 
             baseline, train_info = train_controller(args, selector, optimizer, reward, baseline, log_prob, entropy)
 
             # Training information
             train_info["sparse"] = sparse.item()
-            train_info["keep_ratio"] = (mask > 0.5).float().mean().item()
+            train_info["keep_ratio"] = len(keep_idx) / len(frames)
             train_info["num_select"] = len(keep_idx)
             # monitor buffers
             reward_buf.append(train_info['reward'])
@@ -315,7 +331,7 @@ def main(args):
             kr_buf.append(train_info['keep_ratio'])
 
             # train info print
-            print(f"[{datetime.now().strftime('%m-%d %H:%M:%S')} "
+            print(f"[{datetime.now().strftime('%m-%d %H:%M:%S')}]"
                 f"[INFO] "
                 f"Epoch {epoch + 1} | "
                 f"reward: {train_info['reward']:+.4f} (avg100={sum(reward_buf)/len(reward_buf):+.4f}) | "

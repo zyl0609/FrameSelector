@@ -6,6 +6,8 @@ from PIL import Image
 import sys
 
 # 把你的 reconstructor 文件所在目录加入路径
+from data_utils import *
+from vis_utils import *
 sys.path.append(str(Path(__file__).parent))
 from frame_recon import SelectedFrameReconstructor   # ← 改成实际文件名
 from config import *
@@ -35,26 +37,53 @@ images_list = [Image.open(img_path).convert('RGB') for img_path in images_names]
 recon = SelectedFrameReconstructor(args)
 predictions, _ = recon._vggt_inference(images_list)
 recon.free_image_cache()
-predictions_, _ = recon._vggt_inference(images_list[0:3])
+#predictions_, _ = recon._vggt_inference(images_list[0:3])
+
+
+for i in range(len(images_list)):
+    if i == 0:
+        predictions_, _ = recon._vggt_inference(images_list[i:i+1])
+    else:
+        pred, _ = recon._vggt_inference(images_list[i:i+1])
+
+        for key in pred.keys():
+            if isinstance(pred[key], torch.Tensor):
+                predictions_[key] = torch.cat([predictions[key], pred[key]], dim=0)
+
 recon.free_image_cache()
-rgb_r, _, conf_map, *_ = recon.project_world_points_to_images(
+rgb_r, depth_r, conf_map, *_ = recon.project_world_points_to_images(
     predictions_["images"],
     predictions_["world_points"],
     predictions_["world_points_conf"],
     predictions["extrinsic"],
     predictions["intrinsic"],
-    0.6
+    0.5
 )
-print(predictions_["world_points"].shape)
+print(predictions_["images"].shape)
 
-pseudo_gt_rgb, _, conf_gt_map, *_ = recon.project_world_points_to_images(
+pseudo_gt_rgb, pseudo_gt_depth, conf_gt_map, *_ = recon.project_world_points_to_images(
     predictions["images"],
     predictions["world_points"],
     predictions["world_points_conf"],
     predictions["extrinsic"],
     predictions["intrinsic"],
-    0.6
+    0.5
 )
+
+# test
+#rgb_out, *_ = render_pcd_open3d(
+#    predictions["images"],
+#    predictions["world_points"],
+#    predictions["world_points_conf"],
+#    predictions["extrinsic"],
+#    predictions["intrinsic"],
+#)
+rgb_out = render_pcd_open3d_bev(
+    predictions_["images"],
+    predictions_["world_points"],
+    predictions_["world_points_conf"]
+)
+print(rgb_out.shape)
 
 from reward_utils import ssim_loss
 ssim = ssim_loss(rgb_r, pseudo_gt_rgb, window_size=11)
@@ -84,7 +113,6 @@ print('rgb min/max:', rgb_r.min().item(), '/', rgb_r.max().item())
 print('conf min/max:', predictions["world_points_conf"].min().item(), '/', conf_map.max().item())
 
 
-# TODO:帮我实现一个函数，将RGB map图保存到本地，以便我查看投影效果
 def save_rgb_maps(rgb_maps, save_dir="./output_rgb_maps", name=""):
     os.makedirs(save_dir, exist_ok=True)
     S, C, H, W = rgb_maps.shape
@@ -95,6 +123,7 @@ def save_rgb_maps(rgb_maps, save_dir="./output_rgb_maps", name=""):
         img.save(os.path.join(save_dir, f"rgb_map_{name}_{i:03d}.png"))
     print(f"Saved {S} RGB maps to {save_dir}")
 
-save_rgb_maps(pseudo_gt_rgb, name='gt')   # 结果正常
-save_rgb_maps(rgb_r, name='sparse')    # 投影结果不正常
+save_rgb_maps(pseudo_gt_rgb, name='gt')  
+save_rgb_maps(rgb_r, name='sparse')
+save_rgb_maps(rgb_out, name='batch')
 

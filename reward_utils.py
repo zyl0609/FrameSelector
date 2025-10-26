@@ -19,7 +19,16 @@ def ssim_map(x: torch.Tensor, y: torch.Tensor,
              window_size: int = 11, sigma: float = 1.5,
              C1: float = 0.01 ** 2, C2: float = 0.03 ** 2):
     """
-    计算 SSIM 逐像素 map，返回 shape (B, 3, H, W)
+    Compute pixel-wise SSIM map.
+
+    :param x:
+    :param y:
+    :param window_size:
+    :param sigma:
+    :param C1:
+    :param C2:
+
+    :return ssim:(B, 3, H, W)
     """
     B, C, H, W = x.shape
     assert x.shape == y.shape
@@ -50,38 +59,3 @@ def ssim_loss(x: torch.Tensor, y: torch.Tensor, window_size: int = 11, reduce: s
     if reduce == 'mean':
         return 1 - ssim.mean()
     return 1 - ssim                                # 需要 map 时拿去做 per-pixel weight
-
-
-
-if __name__ == "__main__":
-    # ---------- 1. 构造假数据 ----------
-    B, C, H, W = 4, 3, 128, 128
-    drop_render = torch.rand(B, C, H, W, requires_grad=True)   # 预测图
-    gt_render   = torch.rand(B, C, H, W)                       # 伪 GT
-
-    # ---------- 2. 计算联合 reward ----------
-    alpha = 0.5
-    l1   = F.l1_loss(drop_render, gt_render)
-    ssim = ssim_loss(drop_render, gt_render, window_size=11)
-    reward = -(alpha * l1 + (1 - alpha) * ssim)
-
-    print(f"L1        = {l1.item():.4f}")
-    print(f"SSIM-loss = {ssim.item():.4f}")
-    print(f"reward    = {reward.item():.4f}")   # 期望 ≈ -0.25 左右
-
-    # ---------- 3. 梯度检查 ----------
-    reward.backward()
-    print(f"drop_render.grad norm = {drop_render.grad.norm().item():.4f}")
-
-    # ---------- 4. 模拟 keep-ratio ----------
-    # 假装 selector 输出 mask，随机生成
-    mask = torch.rand(B, 1, 1, 1)           # 0~1
-    keep_ratio = mask.mean().item()
-    print(f"mock keep_ratio = {keep_ratio:.2%}")
-
-    # ---------- 5. 组装完整训练 step ----------
-    sparse_coeff = 0.15
-    sparse = 1.0 - keep_ratio
-    total_reward = reward + sparse_coeff * sparse
-    print(f"sparse term = {sparse_coeff * sparse:.4f}")
-    print(f"total reward= {total_reward.item():.4f}")

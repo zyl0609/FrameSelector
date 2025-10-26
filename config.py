@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument('--max_frame_num', type=int, default=1000, help='max #frames to process in each sequence')
     parser.add_argument('--select_k', type=int, default=500, help='#frames to select')
     parser.add_argument('--select_ratio', type=float, default=0.5, help='ratio of frames to select')
+    parser.add_argument('--hard_ratio', type=float, default=0.5, help='The ratio of frames to force to keep.')
     parser.add_argument('--frame_interval', type=int, default=1, help='take every n-th frame')
     parser.add_argument('--use_ratio', action='store_true', help='use ratio instead of k to select frames')
     # TODO: add other configurations for frame selection here

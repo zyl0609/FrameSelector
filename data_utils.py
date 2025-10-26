@@ -11,6 +11,7 @@ from PIL import Image
 from typing import List, Dict, Tuple, Union
 
 
+
 def get_video_info(video_path:str)->Dict:
     """
     Reading video info from path.
@@ -256,15 +257,3 @@ def read_image_sequences(sequence_path_file: str) -> List[str]:
         seq_paths = [line.strip() for line in f.readlines() if line.strip()]
 
     return seq_paths
-
-
-def vis_rgb_maps(rgb_maps, save_dir="./ckpt", indices = [0]):
-    os.makedirs(save_dir, exist_ok=True)
-    S, C, H, W = rgb_maps.shape
-    rgb_maps = rgb_maps.detach()
-    for i in indices:
-        rgb_map =  rgb_maps[i].detach().clone()
-        rgb_map = rgb_map.permute(1, 2, 0).cpu().numpy()
-        rgb_map = (rgb_map * 255).astype(np.uint8)
-        img = Image.fromarray(rgb_map)
-        img.save(os.path.join(save_dir, f"rgb_map_{i:03d}.png"))
