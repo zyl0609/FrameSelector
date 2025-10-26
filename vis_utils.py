@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import cv2
 import open3d as o3d
 import open3d.visualization.rendering as rendering
 
@@ -85,13 +86,14 @@ def render_pcd_open3d_bev(
     world_points: torch.Tensor,      # (K, H, W, 3)
     world_points_conf: torch.Tensor, # (K, H, W)
     conf_threshold: float = 0.6,
-    bev_size: tuple = (1024, 1024),    # 新增：鸟瞰图分辨率 (W, H)
+    bev_size: tuple = (512, 512),  # (W, H)
+    supersample: int = 4,            # 清晰度旋钮：2/4/8
 ) -> torch.Tensor:                   # 返回 (1, 3, bev_H, bev_W)
     device = images.device
     K, C, H, W = images.shape
-    bev_W, bev_H = bev_size           # 解包目标宽高
+    bev_W, bev_H = bev_size
 
-    # 1. 拼点云
+    # ---------- 1. 拼点云 ----------
     mask = world_points_conf > conf_threshold
     if mask.sum().item() == 0:
         return torch.ones(1, 3, bev_H, bev_W, device=device) * 0.5
@@ -103,35 +105,39 @@ def render_pcd_open3d_bev(
     pcd.points = o3d.utility.Vector3dVector(pts)
     pcd.colors = o3d.utility.Vector3dVector(cols)
 
-    # 2. 离线渲染器（目标分辨率）
-    render = o3d.visualization.rendering.OffscreenRenderer(bev_W, bev_H)
+    # ---------- 2. 超分辨率 ----------
+    super_W, super_H = bev_W * supersample, bev_H * supersample
+    render = o3d.visualization.rendering.OffscreenRenderer(super_W, super_H)
     material = o3d.visualization.rendering.MaterialRecord()
     material.shader = "defaultUnlit"
     render.scene.add_geometry("pcd", pcd, material)
 
-    # 3. 鸟瞰相机（VGGT 坐标系：X右 Y下 Z前）
+    # ---------- 3. 相机参数 ----------
     scene_min, scene_max = pts.min(0), pts.max(0)
     center = (scene_min + scene_max) / 2
     diag = np.linalg.norm(scene_max - scene_min)
 
-    eye = center + np.array([0, -diag * 1.5, 0])   # -Y 上方
+    eye = center + np.array([0, -diag * 0.8, 0])
     lookat = center
     up = np.array([0, 0, 1])
     z = (eye - lookat) / np.linalg.norm(eye - lookat)
-    x = np.cross(up, z); x /= np.linalg.norm(x)
+    x = np.cross(up, z)
+    x /= np.linalg.norm(x)
     y = np.cross(z, x)
     extrinsic = np.eye(4)
     extrinsic[:3, :3] = np.stack([x, y, z], axis=1)
     extrinsic[:3, 3] = -extrinsic[:3, :3] @ eye
 
-    # 4. 焦距按分辨率等比例放大（原 512 时 ~650）
-    scale = bev_W / 512.0
+    scale = super_W / 512.0
     fx = fy = 650.0 * scale
-    cx, cy = bev_W / 2, bev_H / 2
-    intrinsic = o3d.camera.PinholeCameraIntrinsic(bev_W, bev_H, fx, fy, cx, cy)
+    cx, cy = super_W / 2, super_H / 2
+    intrinsic = o3d.camera.PinholeCameraIntrinsic(
+        super_W, super_H, fx, fy, cx, cy)
     render.setup_camera(intrinsic, extrinsic)
 
-    # 5. 渲染
+    # ---------- 4. 渲染 + 下采样 ----------
     img_o3d = render.render_to_image()
-    rgb = torch.from_numpy(np.asarray(img_o3d)).to(device).float() / 255.0
-    return rgb.permute(2, 0, 1).unsqueeze(0)   # (1, 3, bev_H, bev_W)
+    rgb = np.asarray(img_o3d).astype(np.float32) / 255.0
+    rgb = cv2.resize(rgb, (bev_W, bev_H), interpolation=cv2.INTER_AREA)
+
+    return torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(device)

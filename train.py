@@ -235,20 +235,22 @@ def main(args):
                 reconstructor, 
                 render_img_required=False, 
                 embedding_required=True,
-                pred_required=pr
+                pred_required=pr,
                 seq_size=args.infer_seq_size,
                 pcd_conf_thresh=args.pcd_conf_thresh
             )
             reconstructor.free_image_cache() # free images
             end = time.time()
 
-            # to visualize long sequence points cloud 
+            # DEBUG VIS
+            seq_label = os.path.split(seq_names[seq_ind])[-1]
+            seq_name = os.path.split(os.path.split(seq_names[seq_ind])[0])[-1]
             if pr:
                 brid_view = render_pcd_open3d_bev(
                     full_preds["images"],
                     full_preds["world_points"],
                     full_preds["world_points_conf"],
-                    conf_threshold=args.pcd_conf_thresh
+                    conf_threshold=0.75
                 )
                 vis_rgb_maps(brid_view, os.path.join("./ckpt/vis/long-bird", seq_name + "-" + seq_label), indices = [0])
                 del full_preds
@@ -322,19 +324,15 @@ def main(args):
             end = time.time()
             print(f"[INFO] Running {len(sel_images)} images after selection consumes {end - start:.2f} s.")
             
-            
             #----- DEBUG VIS
             brid_view = render_pcd_open3d_bev(
                     dropped_prds["images"],
                     dropped_prds["world_points"],
                     dropped_prds["world_points_conf"],
-                    conf_threshold=args.pcd_conf_thresh
-                )
+                    conf_threshold=0.75
+            )
             vis_rgb_maps(brid_view, os.path.join("./ckpt/vis/drop-bird", seq_name + "-" + seq_label), indices = [0])
             del dropped_prds
-
-            seq_label = os.path.split(seq_names[seq_ind])[-1]
-            seq_name = os.path.split(os.path.split(seq_names[seq_ind])[0])[-1]
             if epoch == 0:
                 vis_rgb_maps(gt_rgb_map, os.path.join("./ckpt/vis/pseudo", seq_name + "-" + seq_label), indices = [0, 1, 2])
             vis_rgb_maps(dropped_rgb_map, os.path.join("./ckpt/vis/sparse", seq_name + "-" + seq_label), indices = [0, 1, 2])
