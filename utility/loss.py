@@ -226,7 +226,7 @@ def diversity_reward(
     action: int,
     selected_actions: List[int],
     camera_poses: torch.Tensor,
-    neighbor_sz: int = 10,
+    trans_percentile: float = 0.01,
     min_rot_angle_deg: float = 5.0,
  ) -> float:
     """
@@ -234,15 +234,16 @@ def diversity_reward(
 
     :param action: Current action (frame index).
     :param selected_actions: List of selected frame indices.
-    :param camera_poses: Tensor of shape (S, 3, 4) representing camera poses (rotation matrix + translation).
-    :param neighbor_sz: Number of nearest neighbors to consider for thresholding.
+    :param camera_poses: Tensor of shape (S, 3, 4) representing all frames' camera poses (rotation matrix + translation).
+    :param trans_percentile: Percentile for translation distance thresholding.
     :param min_rot_angle_deg: Minimum rotation angle distance (in degrees) for full rotation reward
     """
+
+    S = camera_poses.size(0)
 
     if not selected_actions:
         return 1.0  # no penalty if no frames selected
     
-   
     translations = camera_poses[:, :, 3]  # (S, 3)
     current_trans = translations[action]  # (3,)
 
@@ -252,9 +253,9 @@ def diversity_reward(
         dim=-1, p=2
     )  # (S,)
 
-    # get threshold distance (10th smallest distance)
-    # small than it, may be redundant
-    k = min(neighbor_sz, len(distances) - 1)
+    # dynamic threshold: kth smallest distance, so that at least neighbor_sz frames are further
+    # than this distance; if less frames exist, use the largest distance as threshold
+    k = max(1, int(S * trans_percentile)) # e.g. 10 of 1000 frames
     threshold = torch.kthvalue(distances, k).value.item()
 
     # compute minimum distance to selected frames
@@ -288,9 +289,61 @@ def diversity_reward(
     else:
         min_rot_rad = 3.14159  # the first selection gets full reward
 
-
     # rotation reward
     min_rot_deg = torch.rad2deg(torch.tensor(min_rot_rad)).item()
     rot_reward = min(min_rot_deg / min_rot_angle_deg, 1.0) # only greater than threshold gets full reward
 
     return 0.3 * trans_reward + 0.7 * rot_reward
+
+
+def coverage_reward_adaptive(
+    action: int,
+    selected_actions: List[int],
+    poses: torch.Tensor,
+    k_coverage: int = 5,  # 唯一超参数：期望覆盖的最近未选帧数
+) -> float:
+    """
+    自适应覆盖奖励：统计在"有意义"距离内的未选帧数量
+    "有意义"由当前位置到所有未选帧的距离分布动态决定
+    """
+    if len(selected_actions) < 3:
+        return 0.0
+    
+    S = poses.size(0)
+    translations = poses[:, :, 3]
+    current_trans = translations[action]
+    
+    # 未选帧集合
+    all_indices = set(range(S))
+    unselected = list(all_indices - set(selected_actions))
+    
+    if not unselected:
+        return 0.0
+    
+    unselected_trans = translations[unselected]
+    
+    # 1. 计算到所有未选帧的距离
+    distances = torch.norm(
+        current_trans.unsqueeze(0) - unselected_trans, 
+        dim=-1, p=2
+    )  # shape: (num_unselected,)
+    
+    # 2. 动态定义"有意义"的覆盖半径
+    #    使用距离的中位数作为基准（自适应于场景密度）
+    median_dist = distances.median().item()
+    
+    # 3. 统计在median_dist/2范围内的未选帧数
+    #    逻辑：如果一个区域内部还有很多未选帧，说明此处"值得深耕"
+    local_radius = median_dist / 2.0
+    coverage_count = (distances < local_radius).float().sum().item()
+    
+    # 4. 归一化：我们期望至少覆盖k个邻近帧
+    #    如果coverage_count ≥ k → 奖励=1.0（完美覆盖）
+    #    如果coverage_count < k → 奖励按比例衰减
+    reward = min(coverage_count / k_coverage, 1.0)
+    
+    # 5. 惩罚因子：如果median_dist本身太小（<0.01），说明已过度密集
+    if median_dist < 0.01: # hyper-parameters
+        reward *= median_dist / 0.01  # 已经被充分覆盖的区域，奖励打折
+    
+    return reward
