@@ -5,10 +5,21 @@ import cv2
 import argparse
 import os
 import json
+import random
 from natsort import natsorted
 from PIL import Image
 
 from typing import List, Dict, Tuple, Union
+
+
+def set_random_seed(seed: int=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 
@@ -39,7 +50,8 @@ def load_sample_frames(
         path:str,
         frame_interval: int = 1,
         pil_mode: bool = False,
-        max_frames: int=None
+        max_frames: int = None,
+        fix_first: bool = False
     )->Tuple[List[int], List[Union[Image.Image, np.ndarray]]]:
     """
     Load frames from image folder or video file.
@@ -60,11 +72,27 @@ def load_sample_frames(
             raise ValueError(f'[ERROR] No images found in folder: {path}')
         
         if max_frames and len(img_names) > max_frames:
-            start = np.random.randint(0, len(img_names) - max_frames + 1)
-            img_names = img_names[start:start + max_frames]
+            #start = np.random.randint(0, len(img_names) - max_frames + 1)
+            #img_names = img_names[start:start + max_frames]
+            img_names = img_names[:max_frames] # 临时，看看能否过拟合
             print(f"[INFO] The sequence is too long, clip to {len(img_names)}.")
+
+        if fix_first:
+            ref_path = os.path.join(path, img_names[0])
+            try:
+                ref_img = Image.open(ref_path).convert('RGB')
+            except:
+                raise RuntimeError(f"[ERROR] Fail to load ref image {ref_path}")
+            if not pil_mode:
+                ref_img = cv2.cvtColor(np.array(ref_img), cv2.COLOR_RGB2BGR)
+            indices.append(0)
+            frames.append(ref_img)
+
         
         for ind, img_name in enumerate(img_names):
+            if ind == 0 and fix_first:
+                continue
+            
             if ind % frame_interval != 0:
                 continue
             img_path = os.path.join(path, img_name)
