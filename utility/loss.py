@@ -7,9 +7,7 @@ from typing import List, Tuple, Dict
 
 def compute_gae_advantages(
     rewards: torch.Tensor, 
-    values: torch.Tensor,       
-    #next_values: torch.Tensor,
-    #masks: torch.Tensor,
+    values: torch.Tensor,
     gamma: float = 0.99,
     lam: float = 0.95
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -68,7 +66,7 @@ def a2c_loss(
     entropies = results['entropies']      # (B, K)
 
     # policy loss: -E[log π(a|s)·A]
-    policy_loss = - (log_probs * advantages.detach()).mean()
+    policy_loss = -(log_probs * advantages.detach()).mean()
 
     # value loss: E[(V(s) - G)^2]
     value_loss = F.mse_loss(values[:, :-1], returns.detach())
@@ -238,7 +236,7 @@ def diversity_reward(
     :param trans_percentile: Percentile for translation distance thresholding.
     :param min_rot_angle_deg: Minimum rotation angle distance (in degrees) for full rotation reward
     """
-
+ 
     S = camera_poses.size(0)
 
     if not selected_actions:

@@ -61,13 +61,10 @@ class Controller(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Encode the input frame features to hidden states.
-        
-        Args:
-            feats: (B, S, feat_dim): Input frames' feature
-            mask: (B, S) - True=已选/padding，False=可选
-        
-        Returns:
-            h_encoder: (B, S, hidden_size) - 每帧隐状态
+
+        :param feats: Tensor of (B, S, feat_dim) representing input frames' feature
+
+        :returns h_encoder: Tensor of (B, S, hidden_size) representing encoded states
         """
         B, S, _ = feats.shape
         
@@ -85,18 +82,16 @@ class Controller(nn.Module):
         mask: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        解码器单步：给定上一步的输入，输出当前步的 logits 和 value
-        
-        Args:
-            h_encoder: (B, M, hidden_dim) - 编码器输出
-            dec_input: (B, feat_dim) - 上一步选中的帧特征（或 START token）
-            hc: (h_dec, c_dec) - 解码器隐状态
-            mask: (B, M) - True=已选
-        
-        Returns:
-            logits: (B, M) - 剩余帧的未归一化概率
-            value: (B, 1) - 状态价值
-            hc: 更新后的隐状态
+        Decode a single step: given the current state, output the logits over frames,
+
+        :param encode_states: encoder's output hidden state of (B, M, hidden_size)
+        :param decoder_input: current input to decoder of (B, feat_size).
+        :param hc: current hidden state (h_dec, c_dec) of decoder.
+        :param mask: selection mask of (B, M).
+
+        :return logits: logits of remaining frames with (B, M).
+        :return value: (B, 1) - 状态价值
+        :return hc: 更新后的隐状态
         """
         # Determine to select which frame in current state
         # attention score to determine which frame is pointed
@@ -126,18 +121,17 @@ class Controller(nn.Module):
         完整前向：编码 + 解码 N 步
 
 
-        :param feats: (B, S, feat_dim)
-        :param mask: (B, S) - 初始掩码（全 False）
-        :param teacher_actions: (B, K) - 教师动作（用于训练）
-        :param teacher_forcing: 是否用教师动作作为解码器输入
+        :param feats: frame features of (B, S, feat_size).
+        :param teacher_actions: teacher actions of (B, K).
+        :param teacher_forcing: if use teacher actions as forcing input.
+        :param temperature: softmax temperature for action sampling.
 
-
-        :return logits: (B, K, S) - 每步后的logits分布
-        :return actions: (B, K) - selected frame indices
-        :return log_probs: (B, K) - log probabilities after each action
-        :return values: (B, K + 1) - state values (including initial state)
-        :return entropies: (B, K) - entropy after each action
-        :return masks: (B, K, S) - 每步后的 mask（调试用）
+        :return logits: distribution after each time step of shape (B, K, S).
+        :return actions: selected frame indices of shape (B, K).
+        :return log_probs: log probabilities after each action of shape (B, K).
+        :return values: state values (including initial state) of shape (B, K+1).
+        :return entropies: entropy after each action of shape (B, K).
+        :return masks: each step's mask of shape (B, K, S).
         """
         B, S, _ = feats.shape
         device = feats.device
@@ -206,7 +200,7 @@ class Controller(nn.Module):
             'log_probs': torch.stack(log_probs, dim=-1),  # (B, K)
             'values': torch.stack(values, dim=-1),        # (B, K)
             'entropies': torch.stack(entropies, dim=-1),  # (B, K)
-            'masks': torch.stack(masks, dim=1)           # (B, K, S)
+            'masks': torch.stack(masks, dim=1)            # (B, K, S)
         }
     
     

@@ -24,28 +24,32 @@ def parse_args():
     parser.add_argument('--select_k', type=int, default=500, help='#frames to select')
     parser.add_argument('--select_ratio', type=float, default=0.5, help='ratio of frames to select')
     parser.add_argument('--frame_interval', type=int, default=1, help='take every n-th frame')
-    parser.add_argument('--use_ratio', action='store_true', help='use ratio instead of k to select frames')
+    #parser.add_argument('--use_ratio', action='store_true', help='use ratio instead of k to select frames')
     parser.add_argument('--use_dropped', action='store_true', help='use dropped frames as pseudo-ground truth.')
     # TODO: add other configurations for frame selection here
 
 
     # frame selector/controller settings
-    parser.add_argument('--feat_dim', type=int, default=512)
+    parser.add_argument('--feat_size', type=int, default=512)
     parser.add_argument('--slot_sz', type=int, default=10)
     parser.add_argument('--controller_hid_size', type=int, default=256)
-    parser.add_argument('--controller_lr', type=float, default=1e-3)
-    parser.add_argument('--temperature', type=float, default=3.0)
-    parser.add_argument('--sparse_coeff', type=float, default=1e-3)
-    parser.add_argument('--entropy_coeff', type=float, default=0.001)
-    parser.add_argument('--baseline_decay', type=float, default=0.9)
-    parser.add_argument('--controller_grad_clip', type=float, default=10.0)
+    
     
     # training settings
+    parser.add_argument('--warmup_lr', type=float, default=1e-3)
+    parser.add_argument('--controller_lr', type=float, default=1e-4)
+    parser.add_argument('--weight_decay', type=float, default=1e-5)
+    parser.add_argument('--temperature', type=float, default=3.0)
+    parser.add_argument('--sparse_coeff', type=float, default=1e-3)
+    parser.add_argument('--entropy_coeff', type=float, default=0.1)
+    parser.add_argument('--value_coeff', type=float, default=0.5)
+    parser.add_argument('--baseline_decay', type=float, default=0.9)
+    parser.add_argument('--controller_grad_clip', type=float, default=10.0)
+
     parser.add_argument('--device', type=str, default='cuda', choices=['cuda', 'cpu'])
     parser.add_argument('--seed', type=int, default=42, help='global random seed')
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--save_dir', type=str, default='./ckpt', help='directory to save checkpoints and logs')
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'eval'], help='train or eval mode')
     parser.add_argument('--resume', type=str, default=None, help='path to checkpoint for evaluation or resuming training')
     parser.add_argument('--search_epochs', type=int, default=20)
     parser.add_argument('--val_epoch', type=int, default=100)
