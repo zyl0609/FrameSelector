@@ -12,6 +12,7 @@ from PIL import Image
 from typing import List, Dict, Union
 from pathlib import Path
 
+
 class SelectedFrameReconstructor(nn.Module):
     def __init__(self, args):
         """
@@ -62,7 +63,7 @@ class SelectedFrameReconstructor(nn.Module):
             if self.teacher_name in ['vggt', 'm_vggt', 'fast_vggt']:
                 if isinstance(sample_frames, List):
                     if isinstance(sample_frames[0], Image.Image):
-                        from data_utils import load_and_preprocess_sample_frames
+                        from utility.data_utils import load_and_preprocess_sample_frames
                         self._image_cache = load_and_preprocess_sample_frames(sample_frames, target_size=self.args.vggt_imgsz).to(self.device)
                     elif isinstance(sample_frames[0], torch.Tensor):
                         self._image_cache = torch.cat(sample_frames, dim=0).to(self.device)    

@@ -13,7 +13,7 @@ import viser
 from models.frame_recon import SelectedFrameReconstructor
 from models.controller import Controller
 from config import parse_args
-from models.data_utils import load_sample_frames
+from utility.data_utils import load_sample_frames
 
 from typing import Optional
 
