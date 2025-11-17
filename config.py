@@ -46,6 +46,8 @@ def parse_args():
     parser.add_argument('--baseline_decay', type=float, default=0.9)
     parser.add_argument('--controller_grad_clip', type=float, default=10.0)
 
+    parser.add_argument('--warmup_ckpt_path', type=str, default='./weights/warmup.pth', help="warm-up pretrain model path.")
+
     parser.add_argument('--device', type=str, default='cuda', choices=['cuda', 'cpu'])
     parser.add_argument('--seed', type=int, default=42, help='global random seed')
     parser.add_argument('--gpu', type=int, default=0)

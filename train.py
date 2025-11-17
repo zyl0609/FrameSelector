@@ -72,7 +72,7 @@ def main(args):
 
     seq_inds = [i for i in range(len(seq_names))]
     for seq_ind in seq_inds:
-        # path setting
+        # Path setting
         seq_name = os.path.split(os.path.split(seq_names[seq_ind])[0])[-1] # e.g. chess
         seq_label = os.path.split(seq_names[seq_ind])[-1]                  # e.g. seq-03
 
@@ -93,7 +93,16 @@ def main(args):
             feat_size=args.feat_size,
             hidden_size=args.controller_hid_size,
             max_select_nums=max_select_nums
-        ).to(device)
+        )
+
+        # Load warmup checkpoint if exists
+        if args.warmup_ckpt_path is not None and os.path.exists(args.warmup_ckpt_path):
+            print(f"{datetime.now().strftime('%m-%d %H:%M:%S')} "
+                f"[INFO] Load warm-up checkpoint from {args.warmup_ckpt_path}.")
+            checkpoint = torch.load(args.warmup_ckpt_path, map_location='cpu')
+            controller.load_state_dict(checkpoint['controller_state'])
+
+        controller = controller.to(device)
 
         # Build optimizer and learning rate scheduler
         optimizer, lr_scheduler = build_optimizer(args, controller)
