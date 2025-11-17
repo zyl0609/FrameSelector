@@ -62,7 +62,7 @@ class Controller(nn.Module):
         """
         Encode the input frame features to hidden states.
 
-        :param feats: Tensor of (B, S, feat_dim) representing input frames' feature
+        :param feats: Tensor of (B, S, feat_size) representing input frames' feature
 
         :returns h_encoder: Tensor of (B, S, hidden_size) representing encoded states
         """
@@ -82,30 +82,32 @@ class Controller(nn.Module):
         mask: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Decode a single step: given the current state, output the logits over frames,
+        Given the previous state, update it, and output policy and value of new state.
 
-        :param encode_states: encoder's output hidden state of (B, M, hidden_size)
+        :param encode_states: encoder's output hidden state of (B, S, hidden_size)
         :param decoder_input: current input to decoder of (B, feat_size).
         :param hc: current hidden state (h_dec, c_dec) of decoder.
-        :param mask: selection mask of (B, M).
+        :param mask: selection mask of (B, S).
 
-        :return logits: logits of remaining frames with (B, M).
-        :return value: (B, 1) - 状态价值
-        :return hc: 更新后的隐状态
+        :return logits: logits of remaining frames with (B, S).
+        :return value: states value of (B, 1)
+        :return hc: update hidden state (h_dec, c_dec) of decoder.
         """
-        # Determine to select which frame in current state
-        # attention score to determine which frame is pointed
-        q = self.W_q(hc[0]).unsqueeze(1)      # (B, 1, hidden_dim)
-        k = self.W_h(encode_states)           # (B, S, hidden_dim)
+        # update hidden states
+        h_dec, c_dec = self.decoder(decoder_input, hc)
+        
+        # Attention score to determine which frame is pointed
+        q = self.W_q(h_dec).unsqueeze(1)      # (B, 1, hidden_size)
+        k = self.W_h(encode_states)           # (B, S, hidden_size)
+        
         # we using dot attention here
         logits = torch.sum(q * k, dim=-1) / np.sqrt(self.hidden_size)  # (B, S)
-        logits = logits.masked_fill(mask, -1e9) # filter selected
-
+        
+        # filter selected
+        logits = logits.masked_fill(mask, -1e9)
+        
         # value estimates of current state
-        value = self.value_head(hc[0])  # (B, 1)
-
-        # update to next state
-        h_dec, c_dec = self.decoder(decoder_input, hc)
+        value = self.value_head(h_dec)  # (B, 1)
         
         return logits, value, (h_dec, c_dec)
 
@@ -118,20 +120,20 @@ class Controller(nn.Module):
         temperature: float = 1.0
     ) -> Dict[str, torch.Tensor]:
         """
-        完整前向：编码 + 解码 N 步
-
+        Forward function for training with optional teacher forcing.
 
         :param feats: frame features of (B, S, feat_size).
         :param teacher_actions: teacher actions of (B, K).
         :param teacher_forcing: if use teacher actions as forcing input.
         :param temperature: softmax temperature for action sampling.
 
-        :return logits: distribution after each time step of shape (B, K, S).
-        :return actions: selected frame indices of shape (B, K).
-        :return log_probs: log probabilities after each action of shape (B, K).
-        :return values: state values (including initial state) of shape (B, K+1).
-        :return entropies: entropy after each action of shape (B, K).
-        :return masks: each step's mask of shape (B, K, S).
+        :return a dictionary including: 
+            - logits: distribution after each time step of shape (B, K, S).
+            - actions: selected frame indices of shape (B, K).
+            - log_probs: log probabilities after each action of shape (B, K).
+            - values: state values (including initial state) of shape (B, K+1).
+            - entropies: entropy after each action of shape (B, K).
+            - masks: each step's mask of shape (B, K, S).
         """
         B, S, _ = feats.shape
         device = feats.device
@@ -151,9 +153,9 @@ class Controller(nn.Module):
         selected_nums = min(S, self.max_select_nums)
 
         all_logits = []
-        values = []
         actions = []
         log_probs = []
+        values = []
         entropies = []
         masks = []
         
@@ -189,18 +191,18 @@ class Controller(nn.Module):
             
             # select the input feature for next decoding step
             dec_input = feats[row_idx, action]
-        
-        # append the last state's value estimate
+
+        # append the value estimate of K-th state
         value = self.value_head(hc[0])  # (B, 1)
         values.append(value.squeeze())
-
+        
         return {
             'logits': torch.stack(all_logits, dim=1),     # (B, K, S)
             'actions': torch.stack(actions, dim=-1),      # (B, K)
-            'log_probs': torch.stack(log_probs, dim=-1),  # (B, K)
+            'log_probs': torch.stack(log_probs, dim=-1),  # (B, K+1)
             'values': torch.stack(values, dim=-1),        # (B, K)
             'entropies': torch.stack(entropies, dim=-1),  # (B, K)
-            'masks': torch.stack(masks, dim=1)            # (B, K, S)
+            'masks': torch.stack(masks, dim=1)           # (B, K, S)
         }
     
     
@@ -217,7 +219,6 @@ class Controller(nn.Module):
         B, S, _ = feats.shape
         device = feats.device
         
-        # 编码
         encode_states = self._encode(feats)
         c_dec = encode_states[:, -1] # using encoder's last hidden states as long-term memory
         h_dec = torch.zeros_like(c_dec)
@@ -238,5 +239,3 @@ class Controller(nn.Module):
             dec_input = feats[torch.arange(B, device=device), action]
         
         return torch.stack(actions, dim=-1)
-
-        

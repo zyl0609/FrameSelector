@@ -88,7 +88,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         update_attention_in_module(self.aggregator)
 
         # print(
-        #     f"🔧 Updated model attention layer patch dimensions: {patch_width}x{patch_height}"
+        #     f"�� Updated model attention layer patch dimensions: {patch_width}x{patch_height}"
         # )
 
     def forward(
@@ -187,4 +187,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 images  # store the images for visualization during inference
             )
 
-        return predictions
+        # get frame features
+        last_feat = aggregated_tokens_list[-1]              # (1, S, L, 2C)
+        patch_feats = last_feat[:, :, patch_start_idx:, :]   # (1, S, HW, 2C)
+        frame_feats = patch_feats.mean(dim=2)                 # (1, S, 2C)
+
+        return predictions, frame_feats

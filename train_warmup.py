@@ -1,3 +1,10 @@
+"""
+usage:
+python train_warmup.py --warmup_lr=1e-3 --select_ratio=0.1 \
+    --train_seqs=./data/train_seqs.txt \
+    --save_dir=./weights/warmup --device=cuda
+"""
+
 from datetime import datetime
 import time
 import os
@@ -31,11 +38,23 @@ def generate_uniform_teacher_actions(
     return indices.unsqueeze(0).expand(batch_size, -1)
 
 
+def frame_iou(pred_indices, gt_indices):
+    """
+    IoU between two sets of frame indices
+    pred_indices: Tensor or List[int]  (K,)
+    gt_indices  : Tensor or List[int]  (K,)
+    """
+    pred_set = set(pred_indices.cpu().numpy() if torch.is_tensor(pred_indices) else pred_indices)
+    gt_set   = set(gt_indices.cpu().numpy() if torch.is_tensor(gt_indices) else gt_indices)
+    inter = len(pred_set & gt_set)
+    union = len(pred_set | gt_set)
+    return inter / union if union > 0 else 0.0
+
+
 def main(args):
-    set_random_seed(args.seed)
+    #set_random_seed(args.seed)
 
     device = args.device
-    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
     seq_names = read_image_sequences(args.train_seqs)
     print(f"{datetime.now().strftime('%m-%d %H:%M:%S')} "
@@ -43,9 +62,6 @@ def main(args):
     
     seq_inds = [i for i in range(len(seq_names))]
     for seq_ind in seq_inds:
-        seq_name = os.path.split(os.path.split(seq_names[seq_ind])[0])[-1] # e.g. chess
-        seq_label = os.path.split(seq_names[seq_ind])[-1]                  # e.g. seq-03
-        
         start = time.time()
         indices, frames = load_sample_frames(
                 seq_names[seq_ind], 
@@ -53,9 +69,12 @@ def main(args):
                 pil_mode=True,
                 max_frames=args.max_frame_num
         )
+        
         total_frames = len(frames) # sequence length
-
         max_select_nums = max(1, int(args.select_ratio * total_frames))
+        print(f"{datetime.now().strftime('%m-%d %H:%M:%S')} "
+          f"[INFO] Select up to {max_select_nums} frames from {total_frames} frames.")
+
         controller = Controller(
             feat_size=args.feat_size,
             hidden_size=args.controller_hid_size,
@@ -94,7 +113,7 @@ def main(args):
 
 
         epoch_loss = 0.0
-        for epoch in tqdm(range(100)):
+        for epoch in tqdm(range(1000)):
             controller.train()
             teacher_actions = generate_uniform_teacher_actions(B, S, max_select_nums, device)
 
@@ -123,16 +142,21 @@ def main(args):
 
                 _results = controller(frame_feats, temperature=1.0)
 
+                max_logits, _ = torch.max(logits, dim=-1)
+                min_logits, _ = torch.min(logits, dim=-1)
                 mean_entropy = _results["entropies"].mean().item()
                 epoch_loss += loss.item()
 
-                actions = controller.inference(frame_feats, sel_nums=100).cpu().numpy()[0]
+                actions = controller.inference(frame_feats, sel_nums=100).cpu()[0].tolist()
 
             print(f"{datetime.now().strftime('%m-%d %H:%M:%S')} "
                 f"Epoch {epoch + 1}, "
-                f"loss: {epoch_loss / (epoch + 1)}, "
+                f"max logit: {max_logits.mean().item()}, "
+                f"min logits: {min_logits.mean().item()}, "
+                f"mean loss: {epoch_loss / (epoch + 1)}, "
                 f"entropy: {mean_entropy}, "
-                f"actions: {actions[:30]}"
+                f"IoU: {frame_iou(teacher_actions[0], actions)}, "
+                f"\nactions: {actions[:30]}"
             )
 
             if mean_entropy <= 1.8:
@@ -144,8 +168,8 @@ def main(args):
                     'controller_state': controller.state_dict(),
                     'args': args,
                 }
-                
-                fname = os.path.join(args.save_dir, f"{epoch + 1}_warm_up.pth")
+                os.makedirs(args.save_dir, exist_ok=True)
+                fname = os.path.join(args.save_dir, f"warmup_{epoch + 1}.pth")
                 torch.save(state, fname)
                 print(f"{datetime.now().strftime('%m-%d %H:%M:%S')} "
                     f"[INFO] Save warm-up checkpoint to {fname}.")

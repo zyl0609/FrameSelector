@@ -17,9 +17,9 @@ import cv2
 import clip
 
 from config import parse_args
+from models.data_utils import read_image_sequences, load_sample_frames, set_random_seed
 from models.controller import Controller
-from utility.data_utils import read_image_sequences, load_sample_frames, set_random_seed
-from utility.loss import *
+from models.loss import *
 
 from typing import Dict, List, Union
 
@@ -135,8 +135,7 @@ def main(args):
         reconstructor.free_image_cache() # free images   
         end = time.time()
         print(f"{datetime.now().strftime('%m-%d %H:%M:%S')} "
-            f"[INFO] VGGT consumes: {end - start:.2f} s.")
-        
+            f"[INFO] VGGT consumes: {end - start:.2f} s.")       
 
         # Prepare rewards
         clarity_rewards = clarity_reward_from_image_fft(
@@ -153,9 +152,9 @@ def main(args):
         del full_preds # save memory
 
         # Training loop for controller
+        controller.train()
         for epoch in tqdm(range(args.search_epochs)):
-            controller.train()
-
+            
             results = controller(
                 frame_feats, 
                 temperature=args.temperature
