@@ -39,9 +39,9 @@ def parse_args():
     parser.add_argument('--warmup_lr', type=float, default=1e-3)
     parser.add_argument('--controller_lr', type=float, default=5e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-5)
-    parser.add_argument('--temperature', type=float, default=1.0)
+    parser.add_argument('--temperature', type=float, default=3.0)
     parser.add_argument('--sparse_coeff', type=float, default=1e-3)
-    parser.add_argument('--entropy_coeff', type=float, default=1e-3)
+    parser.add_argument('--entropy_coeff', type=float, default=1e-4)
     parser.add_argument('--baseline_decay', type=float, default=0.9)
     parser.add_argument('--controller_grad_clip', type=float, default=10.0)
 

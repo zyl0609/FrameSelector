@@ -142,7 +142,7 @@ def main(args):
         )
 
         for epoch in tqdm(range(args.search_epochs)):
-            entropy_coeff = max(1e-4, args.entropy_coeff * (1 - epoch / args.search_epochs))
+            entropy_coeff = max(1e-6, args.entropy_coeff * (1 - epoch / args.search_epochs))
 
             keep_idx, log_probs, entropies = controller.sample(frame_feats, args.temperature)
             keep_idx = sorted(keep_idx)
