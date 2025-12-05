@@ -115,8 +115,11 @@ def main(args):
         # baseline: uniform step
         step = total_frames // n_clusters
         uniform_indices = list(range(0, total_frames, step))
-        uniform_world_points = full_preds["world_points"][uniform_indices].reshape(-1, 3)
-        uniform_world_points_conf = full_preds["world_points_conf"][uniform_indices].reshape(-1)
+        uniform_frames = [frames[i] for i in uniform_indices]
+        with torch.amp.autocast(device, enabled=True, dtype=dtype):
+            uniform_preds, _ = reconstructor(uniform_frames)
+        reconstructor.free_image_cache() # free images
+        uniform_world_points = uniform_preds["world_points"].reshape(-1, 3)
 
         # filter points with low confidence
         pcd_keep_ratio = 0.9
@@ -126,10 +129,7 @@ def main(args):
         valid_mask = world_points_conf >= conf_thresh
         world_points = world_points[valid_mask]
 
-        valid_mask = uniform_world_points_conf >= conf_thresh
-        uniform_world_points = uniform_world_points[valid_mask]
-
-        del full_preds
+        del full_preds, uniform_preds
 
         # downsample
         fused_points = point_cloud_to_volume(
@@ -184,7 +184,7 @@ def main(args):
             cov = coverage(
                 full_points, 
                 sel_points, 
-                distance_threshold=0.02
+                distance_threshold=0.01
             )
             end = time.time()
             print(f"{datetime.now().strftime('%m-%d %H:%M:%S')} "
@@ -200,7 +200,7 @@ def main(args):
                 base_cov = coverage(
                     full_points,
                     uniform_sel_points,
-                    distance_threshold=0.02
+                    distance_threshold=0.01
                 )
                 print(f"{datetime.now().strftime('%m-%d %H:%M:%S')} "
                     f"[INFO] Baseline Coverage: {base_cov:.3f}"
@@ -209,11 +209,11 @@ def main(args):
             #reward = -1000.0 * (acc + comp) # chamfer distance
             #reward = 10.0 * cov
                 
-            alpha = 50.0 if cov > base_cov else 5.0
+            alpha = 50.0 if cov > base_cov else 10.0
             reward = alpha * (cov - base_cov)
 
             print(f"{datetime.now().strftime('%m-%d %H:%M:%S')} "
-                f"[INFO] Reward: {reward:.5f}, Cov: {cov:3f}, Acc: {acc:.5f}, Comp: {comp:.5f}"
+                f"[INFO] Reward: {reward:.5f}, Cov: {cov:.3f}, Baseline:{base_cov:.3f}, Acc: {acc:.5f}, Comp: {comp:.5f}"
             )
 
             # update controller
@@ -250,7 +250,7 @@ def main(args):
                 pass
             
         try:
-            del frame_feats, world_points, world_points_conf, fused_points
+            del frame_feats, world_points, world_points_conf, fused_points, uniform_fused_points
         except:
             pass
         
