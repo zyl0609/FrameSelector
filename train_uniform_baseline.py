@@ -42,7 +42,7 @@ def main(args):
         # validation log path
         log_folder = os.path.join('log', seq_name, seq_label)
         os.makedirs(log_folder, exist_ok=True)
-        log_name = "keep_" + datetime.now().strftime('%y%m%d%H%M%S')
+        log_name = "keep_" + datetime.now().strftime('%m-%d-%H-%M-%S')
         log_path = os.path.join(log_folder, log_name)
 
         start = time.time()
@@ -213,7 +213,10 @@ def main(args):
                 )
             
             #reward = -1000.0 * (acc + comp) # chamfer distance
-            reward = 10.0 * cov
+            #reward = 10.0 * cov
+                
+            alpha = 50.0 if cov > base_cov else 10.0
+            reward = alpha * (cov - base_cov)
 
             print(f"{datetime.now().strftime('%m-%d %H:%M:%S')} "
                 f"[INFO] Reward: {reward:.5f}, Cov: {cov:.3f}, Baseline:{base_cov:.3f}, Acc: {acc:.5f}, Comp: {comp:.5f}"
@@ -241,7 +244,7 @@ def main(args):
             if (epoch + 1) % 10 == 0:
                 selected_inds, _entropies = controller.inference(frame_feats)
                 selected_inds = sorted(selected_inds)
-                
+
                 with open(log_path, 'a') as f:
                     f.write(f"#Epoch: {epoch+1}, Entropy: {_entropies:.6f}, Keep: {selected_inds}\n")
 
@@ -275,7 +278,8 @@ def train_controller(
         baseline = args.baseline_decay * baseline + (1 - args.baseline_decay) * reward
         baseline = baseline.clone().detach()
 
-    adv = reward - baseline
+    #adv = reward - baseline
+    adv = reward # directly use reward
     print("[TRAINING] advantage", adv.item())
     loss = -log_prob * adv 
     loss -= entropy_coeff * entropies
